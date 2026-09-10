@@ -27,6 +27,11 @@ Use `bash scripts/bundle.sh release` for an optimized build. Bundles are locally
 ad-hoc signed, not notarized. The script sets the macOS 15 deployment target.
 `Cargo.lock` records the resolved dependencies. No FFmpeg installation is needed.
 
+For Apple Silicon direct-download releases, see [production build and signing](docs/releases.md).
+`bash scripts/release.sh local` builds a local-only optimized app without a paid
+Apple account. `bash scripts/release.sh publish` requires Developer ID credentials
+and produces a signed, notarized, stapled ZIP; it never falls back to ad-hoc signing.
+
 ## Configuration
 
 - Use **Add Source…** in the left sidebar to name a recording and choose its video
