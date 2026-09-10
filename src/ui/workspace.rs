@@ -4,7 +4,7 @@ use std::cell::RefCell;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, sel};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::*;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -22,6 +22,19 @@ const DRAWER_CLOSED: f64 = 44.0;
 const GAP: f64 = 20.0;
 const GRID_INSET: f64 = 8.0;
 const ROW_HEIGHT: f64 = 68.0;
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    struct WorkspaceView;
+
+    impl WorkspaceView {
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            true
+        }
+    }
+);
 
 pub(super) struct Workspace {
     pub window: Retained<NSWindow>,
@@ -228,11 +241,17 @@ pub(super) fn build(delegate: &AppDelegate) -> Workspace {
     window.setBackgroundColor(Some(&NSColor::windowBackgroundColor()));
     window.setDelegate(Some(ProtocolObject::from_ref(delegate)));
     unsafe { window.setReleasedWhenClosed(false) };
-    let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 1240.0, 880.0));
+    let root = WorkspaceView::alloc(mtm).set_ivars(());
+    let root: Retained<WorkspaceView> =
+        unsafe { msg_send![super(root), initWithFrame: rect(0.0, 0.0, 1240.0, 880.0)] };
+    let root: Retained<NSView> = root.into_super();
     root.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     window.setContentView(Some(&root));
+    // Do not auto-edit an output field on launch. That eagerly creates macOS's
+    // text-input cursor window, which can briefly appear as an empty window.
+    window.setInitialFirstResponder(Some(&root));
 
     let background = panel(&root, &NSColor::windowBackgroundColor(), mtm);
     background.setFrame(root.bounds());
@@ -618,6 +637,13 @@ pub(super) fn refresh_group(delegate: &AppDelegate) {
 }
 
 impl Workspace {
+    pub fn smoke_gpu_ready(&self, id: RecordingId) -> bool {
+        self.cards
+            .borrow()
+            .iter()
+            .any(|card| card.id == id && card.preview.smoke_gpu_ready())
+    }
+
     pub fn smoke_check_orientation(&self, id: RecordingId, screenshot: &std::path::Path) {
         let cards = self.cards.borrow();
         let card = cards

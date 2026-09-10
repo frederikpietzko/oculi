@@ -470,6 +470,16 @@ impl Preview {
         self.overlay.as_ref().unwrap().setHidden(!visible);
     }
 
+    pub fn smoke_gpu_ready(&self) -> bool {
+        self.visible()
+            && self.last.borrow().is_some()
+            && self
+                .presenter
+                .borrow()
+                .as_ref()
+                .is_ok_and(|p| p.presented_frames() > 0)
+    }
+
     pub fn smoke_check_gpu_completion(&self) {
         assert!(
             self.presenter.borrow().as_ref().unwrap().presented_frames() > 0,
@@ -851,6 +861,18 @@ impl AppDelegate {
         c.width.setStringValue(&ns(&canvas.width.to_string()));
         c.height.setStringValue(&ns(&canvas.height.to_string()));
         self.smoke_click(sel!(applyChanges:));
+        assert_eq!(
+            self.ivars()
+                .state
+                .borrow()
+                .selected()
+                .unwrap()
+                .output
+                .resolution,
+            canvas,
+            "Canvas edit failed: {}",
+            self.ivars().state.borrow().message,
+        );
         self.poll_previews();
         let preview = &c.framing.preview;
         assert_eq!(preview.canvas.get(), canvas);

@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{
+    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::*;
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer,
@@ -428,8 +430,11 @@ impl AppDelegate {
         if c.window.attachedSheet().is_some() {
             return;
         }
+        // Discovery may rebuild cards after this tick's regular preview poll.
+        self.poll_previews();
         match self.ivars().smoke_phase.get() {
             0 => {
+                self.smoke_check_startup_windows();
                 self.smoke_click(sel!(addRecording:));
                 assert!(self.ivars().source_draft.borrow().is_some());
                 assert!(self.ivars().state.borrow().settings.recordings.is_empty());
@@ -451,6 +456,14 @@ impl AppDelegate {
             }
             2 => {
                 assert_eq!(self.ivars().state.borrow().settings.recordings.len(), 1);
+                assert!(c.window.makeFirstResponder(Some(&c.width)));
+                assert!(
+                    c.width.currentEditor().is_some(),
+                    "Output fields must remain editable on demand"
+                );
+                assert!(c.window.makeFirstResponder(
+                    c.window.contentView().as_deref().map(|view| view.as_ref())
+                ));
                 c.width.setStringValue(&ns("1921"));
                 assert!(!self.commit_editor(false), "invalid output was accepted");
                 c.width.setStringValue(&ns("1920"));
@@ -608,6 +621,14 @@ impl AppDelegate {
                 });
             }
             10 => {
+                let id = self.ivars().smoke_preview.borrow().as_ref().unwrap().0;
+                if !c.workspace.smoke_gpu_ready(id) || !c.framing.preview.smoke_gpu_ready() {
+                    assert!(
+                        self.ivars().smoke_preview_ticks.get() < 150,
+                        "Visible workspace and Framing previews did not complete GPU presentation within five seconds"
+                    );
+                    return;
+                }
                 assert!(self.ivars().smoke_preview_ticks.get() >= 3);
                 c.framing.preview.smoke_check_gpu_completion();
                 assert!(
@@ -1109,6 +1130,45 @@ impl AppDelegate {
         button
     }
 
+    fn smoke_check_startup_windows(&self) {
+        let c = self.controls();
+        let windows = NSApplication::sharedApplication(self.mtm()).windows();
+        for window in &windows {
+            println!(
+                "Startup window: title={:?}, number={}, visible={}, frame={:?}, content={:?}",
+                window.title(),
+                window.windowNumber(),
+                window.isVisible(),
+                window.frame(),
+                window.contentView(),
+            );
+        }
+        assert!(c.window.isVisible(), "Workspace must be visible at startup");
+        assert_eq!(
+            windows.len(),
+            4,
+            "Startup unexpectedly created a native helper window"
+        );
+        assert!(
+            !c.window
+                .firstResponder()
+                .is_some_and(|responder| responder.isKindOfClass(NSTextView::class())),
+            "Startup must not enter text editing and create the macOS text-input helper window"
+        );
+        for window in [&c.source.window, &c.global.window, &c.framing.window] {
+            assert!(
+                !window.isVisible(),
+                "Unexpected startup window: {}",
+                window.title()
+            );
+        }
+        assert_eq!(
+            windows.iter().filter(|window| window.isVisible()).count(),
+            1,
+            "Only the workspace should be visible at startup"
+        );
+    }
+
     fn build_window(&self) {
         let workspace = workspace::build(self);
         let source = dialogs::source(self);
@@ -1138,6 +1198,9 @@ impl AppDelegate {
         self.controls().window.makeKeyAndOrderFront(None);
         #[allow(deprecated)]
         NSApplication::sharedApplication(self.mtm()).activateIgnoringOtherApps(true);
+        if self.ivars().smoke_directory.is_some() {
+            self.smoke_check_startup_windows();
+        }
     }
 }
 
