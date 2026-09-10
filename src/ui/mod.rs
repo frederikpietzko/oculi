@@ -2,6 +2,7 @@
 
 mod dialogs;
 mod group;
+mod resolution;
 mod source_picker;
 mod viewport;
 mod workspace;
@@ -55,6 +56,10 @@ struct DelegateIvars {
     controls: OnceCell<Controls>,
     videos: RefCell<Vec<VideoSourceSelector>>,
     audios: RefCell<Vec<AudioSourceSelector>>,
+    resolutions: RefCell<Vec<Option<crate::model::Resolution>>>,
+    resolution_labels: RefCell<Vec<String>>,
+    resolution_draft: RefCell<resolution::ResolutionDraft>,
+    resolution_refresh_due: Cell<bool>,
     discovery: RefCell<Option<Receiver<SourceCatalog>>>,
     last_refresh: Cell<Instant>,
     last_slow_tick: Cell<Instant>,
@@ -179,9 +184,7 @@ define_class!(
             match result {
                 Some(Ok(catalog)) => {
                     self.ivars().discovery.borrow_mut().take();
-                    let changed = self.ivars().state.borrow().catalog != catalog;
-                    self.ivars().state.borrow_mut().update_catalog(catalog);
-                    if changed { self.refresh_pickers(); self.refresh_list(); }
+                    self.update_resolution_catalog(catalog);
                 }
                 Some(Err(TryRecvError::Disconnected)) => {
                     self.ivars().discovery.borrow_mut().take();
@@ -189,6 +192,7 @@ define_class!(
                 }
                 _ => {}
             }
+            if self.ivars().resolution_refresh_due.get() { self.refresh_resolution_picker(); }
             if discovery::take_device_changes() { self.ivars().device_refresh_due.set(true); }
             let elapsed = self.ivars().last_refresh.get().elapsed();
             if elapsed >= Duration::from_secs(5) || (self.ivars().device_refresh_due.get() && elapsed >= Duration::from_millis(500)) { self.begin_refresh(); }
@@ -325,6 +329,11 @@ define_class!(
             self.read_source_selection();
         }
 
+        #[unsafe(method(resolutionChanged:))]
+        fn resolution_changed(&self, _sender: &NSPopUpButton) {
+            self.choose_resolution();
+        }
+
         #[unsafe(method(audioChanged:))]
         fn audio_changed(&self, _sender: &NSPopUpButton) {
             self.read_source_selection();
@@ -393,6 +402,10 @@ impl AppDelegate {
             controls: OnceCell::new(),
             videos: RefCell::new(Vec::new()),
             audios: RefCell::new(Vec::new()),
+            resolutions: RefCell::new(Vec::new()),
+            resolution_labels: RefCell::new(Vec::new()),
+            resolution_draft: RefCell::new(resolution::ResolutionDraft::default()),
+            resolution_refresh_due: Cell::new(false),
             discovery: RefCell::new(None),
             last_refresh: Cell::new(Instant::now()),
             last_slow_tick: Cell::new(Instant::now()),
@@ -456,6 +469,8 @@ impl AppDelegate {
             }
             2 => {
                 assert_eq!(self.ivars().state.borrow().settings.recordings.len(), 1);
+                self.smoke_resolution_choices();
+                self.smoke_select_resolution(None);
                 assert!(c.window.makeFirstResponder(Some(&c.width)));
                 assert!(
                     c.width.currentEditor().is_some(),
@@ -466,8 +481,27 @@ impl AppDelegate {
                 ));
                 c.width.setStringValue(&ns("1921"));
                 assert!(!self.commit_editor(false), "invalid output was accepted");
+                let catalog = self.ivars().state.borrow().catalog.clone();
+                self.update_resolution_catalog(catalog);
+                assert_eq!(c.width.stringValue().to_string(), "1921");
+                assert_eq!(
+                    c.template.stringValue().to_string(),
+                    "{name}-resolution-smoke"
+                );
                 c.width.setStringValue(&ns("1920"));
+                c.height.setStringValue(&ns("1080"));
                 self.smoke_click(sel!(applyChanges:));
+                assert_eq!(
+                    self.ivars()
+                        .state
+                        .borrow()
+                        .selected()
+                        .unwrap()
+                        .output
+                        .resolution,
+                    crate::model::Resolution::default()
+                );
+                self.smoke_resolution_lock();
                 self.smoke_click(sel!(editRecording:));
                 c.name.setStringValue(&ns("Canceled edit"));
                 self.smoke_click(sel!(cancelSource:));
@@ -551,6 +585,9 @@ impl AppDelegate {
                 c.window.setContentSize(NSSize::new(1440.0, 900.0));
                 workspace::layout(self);
                 assert!(c.workspace.grid.subviews().count() >= 2);
+                c.window.setContentSize(NSSize::new(1080.0, 760.0));
+                workspace::layout(self);
+                c.workspace.smoke_check_output_layout();
                 c.window.setContentSize(NSSize::new(1120.0, 800.0));
                 workspace::layout(self);
                 let menu = NSApplication::sharedApplication(self.mtm())
@@ -901,8 +938,8 @@ impl AppDelegate {
         recording.output.directory = c.directory.stringValue().to_string().into();
         recording.output.filename_template = c.template.stringValue().to_string();
         let parsed = (
-            c.width.stringValue().to_string().parse(),
-            c.height.stringValue().to_string().parse(),
+            resolution::field_text(&c.width).parse(),
+            resolution::field_text(&c.height).parse(),
             c.fps.stringValue().to_string().parse(),
         );
         match parsed {
@@ -928,6 +965,9 @@ impl AppDelegate {
             self.show_error(&error);
             return false;
         }
+        if self.ivars().resolution_draft.borrow().explicit {
+            recording.output.resolution_default_pending = false;
+        }
         let result = self
             .ivars()
             .state
@@ -937,6 +977,7 @@ impl AppDelegate {
             self.show_error(&error);
             return false;
         }
+        self.resolution_draft_committed();
         true
     }
 
@@ -977,6 +1018,7 @@ impl AppDelegate {
             }
         }
         drop(state);
+        self.reset_resolution_draft();
         self.refresh_pickers();
         self.refresh_list();
         self.refresh_status();

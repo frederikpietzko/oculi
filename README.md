@@ -37,6 +37,15 @@ ad-hoc signed, not notarized. The script sets the macOS 15 deployment target.
   resolution and FPS in the bottom **Recording output** drawer. **Apply Output**
   saves changes; Return, switching sources and quitting also apply valid output
   edits. Collapse the drawer to make more room for the card grid.
+- The resolution dropdown offers discovered source sizes and common presets, plus
+  **Custom…** for manual width/height entry. New recordings default to the highest
+  discovered resolution of the **first configured video source**, even when later
+  sources have different sizes. Highest means largest pixel area; odd native sizes
+  are rounded down to even H.264 dimensions. Until discovery succeeds, the fallback
+  is 1920×1080. Defaults resolve once; saved sizes and explicit overrides are preserved,
+  and resizing a source does not resize an already resolved output canvas.
+  Presets are output sizes, not guarantees of camera FPS or hardware encoder support;
+  native writer support is checked before recording.
 - Preview cards show live, independently framed video. **Framing…** opens a larger
   editor: drag to reposition, drag a corner to resize, Option-drag a corner to crop,
   and scroll to zoom. Numeric controls plus Fit / Fill / Reset are also available.

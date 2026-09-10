@@ -19,7 +19,7 @@ Build Oculi as a responsive Rust application with a native macOS interface for s
 - Native light/dark appearance, clear per-recording status, elapsed time, audio activity, permission guidance, and actionable errors.
 
 ### Output and lifecycle defaults
-- MP4 with H.264 video and AAC audio; default 1080p/30 fps, with per-recording resolution/FPS settings validated before starting. SDR output only initially.
+- MP4 with H.264 video and AAC audio; default 30 fps and the first configured video source's highest discovered resolution for all recordings, with per-recording overrides. Offer a native resolution dropdown and Custom width/height entry; use 1080p while source dimensions are unknown. Preserve existing saved output sizes. Validate resolution/FPS before starting. SDR output only initially.
 - Directory picker per recording and a template such as `{name}_{date}_{time}_{counter}.mp4`; use one group start timestamp, sanitize filenames, and never overwrite an existing file.
 - Source, destination, and output-format settings are locked while a group is active; framing remains editable. Stop finishes every writer asynchronously and reports each saved path or failure.
 - Preflight the whole group before starting. If a required source or writer fails during recording, stop the group and attempt to finalize all usable partial outputs; report failures explicitly.
@@ -172,3 +172,10 @@ Start, Pause, Resume, and Stop & Save reliably control every configured recordin
 - Lock source/output configuration during an active group while allowing viewport edits and paused previews.
 - Stop the group on fatal source/writer errors, finalize usable outputs, and release resources correctly on completion or application exit.
 - Exercise state-machine failure scenarios and end-to-end concurrent capture; run formatting, linting, automated tests, and available macOS bundle smoke checks.
+
+### ✓ Step 7: Add source-aware recording resolution choices
+Offer a native resolution dropdown with manual width/height fallback.
+- Discover native camera resolutions and pixel dimensions for display/window/application sources asynchronously.
+- Default new recordings to the first configured video source's highest discovered resolution, preserving saved sizes and individual overrides.
+- Keep source/output configuration locked while recording; preserve fixed canvases during source resizing.
+- Test resolution ranking, first-source defaults, persistence, overrides, and native dropdown behavior.

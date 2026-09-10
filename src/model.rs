@@ -181,6 +181,10 @@ impl Default for Resolution {
 pub struct OutputSettings {
     pub format: OutputFormat,
     pub resolution: Resolution,
+    /// New configurations resolve this default once source dimensions are known.
+    /// Missing metadata in older settings preserves the existing explicit size.
+    #[serde(default)]
+    pub resolution_default_pending: bool,
     pub fps: u32,
     pub directory: PathBuf,
     /// Filename template, e.g. `{name}_{date}_{time}_{counter}.mp4`.
@@ -192,6 +196,7 @@ impl Default for OutputSettings {
         Self {
             format: OutputFormat::default(),
             resolution: Resolution::default(),
+            resolution_default_pending: true,
             fps: 30,
             directory: default_output_directory(),
             filename_template: "{name}_{date}_{time}_{counter}.mp4".to_string(),
@@ -376,5 +381,27 @@ mod tests {
     #[test]
     fn output_settings_defaults_are_valid() {
         assert!(OutputSettings::default().validate_format().is_ok());
+    }
+
+    #[test]
+    fn resolution_default_metadata_round_trips_and_preserves_legacy_sizes() {
+        let new = OutputSettings::default();
+        assert!(new.resolution_default_pending);
+        let mut json = serde_json::to_value(&new).unwrap();
+        let restored: OutputSettings = serde_json::from_value(json.clone()).unwrap();
+        assert!(restored.resolution_default_pending);
+        json.as_object_mut()
+            .unwrap()
+            .remove("resolution_default_pending");
+        json["resolution"] = serde_json::json!({"width": 1000, "height": 560});
+        let old: OutputSettings = serde_json::from_value(json).unwrap();
+        assert!(!old.resolution_default_pending);
+        assert_eq!(
+            old.resolution,
+            Resolution {
+                width: 1000,
+                height: 560
+            }
+        );
     }
 }

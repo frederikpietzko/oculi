@@ -1,15 +1,41 @@
 //! Platform-independent source identity and validation.
 
-use crate::model::{AudioSourceSelector, RecordingConfig, SourceAvailability, VideoSourceSelector};
+use crate::model::{
+    AudioSourceSelector, RecordingConfig, Resolution, SourceAvailability, VideoSourceSelector,
+};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SourceCatalog {
     pub videos: Vec<VideoSourceSelector>,
     pub audios: Vec<AudioSourceSelector>,
+    pub video_resolutions: Vec<(VideoSourceSelector, Vec<Resolution>)>,
     pub warnings: Vec<String>,
 }
 
 impl SourceCatalog {
+    /// Native sizes, largest pixel area first, rounded down for H.264's even dimensions.
+    pub fn resolutions(&self, source: &VideoSourceSelector) -> Vec<Resolution> {
+        if matches!(source, VideoSourceSelector::None)
+            || !self.videos.iter().any(|video| same_video(video, source))
+        {
+            return Vec::new();
+        }
+        let mut sizes: Vec<_> = self
+            .video_resolutions
+            .iter()
+            .filter(|(video, _)| same_video(video, source))
+            .flat_map(|(_, sizes)| sizes.iter())
+            .filter_map(|size| {
+                let size = Resolution {
+                    width: size.width / 2 * 2,
+                    height: size.height / 2 * 2,
+                };
+                (size.width > 0 && size.height > 0).then_some(size)
+            })
+            .collect();
+        sort_resolutions(&mut sizes);
+        sizes
+    }
     /// Updates availability only; never changes a selection or its saved label.
     /// `None` is unavailable: a required source has not been selected.
     ///
@@ -46,6 +72,17 @@ impl SourceCatalog {
                 .iter()
                 .all(|a| self.audios.iter().any(|b| same_audio(a, b)))
     }
+}
+
+pub fn sort_resolutions(sizes: &mut Vec<Resolution>) {
+    sizes.sort_by_key(|size| {
+        std::cmp::Reverse((
+            u64::from(size.width) * u64::from(size.height),
+            size.width,
+            size.height,
+        ))
+    });
+    sizes.dedup();
 }
 
 fn availability(found: bool) -> SourceAvailability {
@@ -120,6 +157,73 @@ mod tests {
     }
 
     #[test]
+    fn resolution_choices_use_identity_and_rank_real_even_sizes_by_area() {
+        let source = camera("a", "Same label");
+        let mut catalog = SourceCatalog {
+            videos: vec![source.clone()],
+            video_resolutions: vec![
+                (
+                    camera("other", "Same label"),
+                    vec![Resolution {
+                        width: 7680,
+                        height: 4320,
+                    }],
+                ),
+                (
+                    camera("a", "Old label"),
+                    vec![
+                        Resolution {
+                            width: 1920,
+                            height: 1080,
+                        },
+                        Resolution {
+                            width: 3841,
+                            height: 2161,
+                        },
+                        Resolution {
+                            width: 3840,
+                            height: 2160,
+                        },
+                        Resolution {
+                            width: 4096,
+                            height: 1000,
+                        },
+                        Resolution {
+                            width: 0,
+                            height: 1080,
+                        },
+                        Resolution {
+                            width: 1,
+                            height: 1,
+                        },
+                    ],
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            catalog.resolutions(&source),
+            vec![
+                Resolution {
+                    width: 3840,
+                    height: 2160
+                },
+                Resolution {
+                    width: 4096,
+                    height: 1000
+                },
+                Resolution {
+                    width: 1920,
+                    height: 1080
+                },
+            ]
+        );
+        assert!(catalog.resolutions(&VideoSourceSelector::None).is_empty());
+        catalog.videos.clear();
+        assert!(catalog.resolutions(&source).is_empty());
+    }
+
+    #[test]
     fn device_identity_ignores_labels_not_ids() {
         assert!(same_video(&camera("a", "Old"), &camera("a", "New")));
         assert!(!same_video(&camera("a", "Same"), &camera("b", "Same")));
@@ -187,6 +291,7 @@ mod tests {
             videos: vec![camera("different", "Saved camera")],
             audios: vec![AudioSourceSelector::System],
             warnings: vec![],
+            ..Default::default()
         };
         catalog.revalidate(&mut config);
         assert_eq!(config.video_availability, SourceAvailability::Unavailable);
@@ -208,6 +313,7 @@ mod tests {
             videos: vec![camera("a", "Renamed")],
             audios: vec![microphone("m", "Renamed")],
             warnings: vec![],
+            ..Default::default()
         }
         .revalidate(&mut config);
         assert_eq!(config.video_availability, SourceAvailability::Available);
@@ -226,6 +332,7 @@ mod tests {
             videos: vec![VideoSourceSelector::None],
             audios: vec![AudioSourceSelector::None],
             warnings: vec![],
+            ..Default::default()
         }
         .revalidate(&mut config);
         assert_eq!(config.video_availability, SourceAvailability::Unavailable);
@@ -238,11 +345,13 @@ mod tests {
             videos: vec![camera("a", "Old"), camera("b", "B")],
             audios: vec![AudioSourceSelector::System],
             warnings: vec![],
+            ..Default::default()
         };
         let mut b = SourceCatalog {
             videos: vec![camera("b", "B"), camera("a", "New")],
             audios: a.audios.clone(),
             warnings: vec!["Warning".into()],
+            ..Default::default()
         };
         assert!(a.same_sources(&b));
         assert_ne!(a, b);

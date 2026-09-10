@@ -765,6 +765,7 @@ impl AppDelegate {
     pub(super) fn smoke_start_presentation(&self) {
         let frame = crate::render::synthetic_preview_frame().expect("synthetic rendered frame");
         let c = self.controls();
+        self.smoke_select_resolution(None);
         c.width.setStringValue(&ns(&frame.canvas.width.to_string()));
         c.height
             .setStringValue(&ns(&frame.canvas.height.to_string()));
@@ -829,6 +830,7 @@ impl AppDelegate {
 
     pub(super) fn smoke_check_canvas_change(&self) {
         let c = self.controls();
+        self.smoke_select_resolution(None);
         let mut pending = self.ivars().state.borrow().selected().unwrap().clone();
         pending.viewport.offset_x += 0.01;
         let frame = self

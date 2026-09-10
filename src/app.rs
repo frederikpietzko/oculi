@@ -8,7 +8,7 @@ use crate::capture::service::{CaptureSnapshot, CaptureState, CaptureTarget};
 use crate::capture::{CaptureFormat, CaptureRequest, SourceKey};
 use crate::discovery::SourceCatalog;
 use crate::model::{
-    GroupState, OutputSettings, RecordingConfig, RecordingId, SourceAvailability,
+    GroupState, OutputSettings, RecordingConfig, RecordingId, Resolution, SourceAvailability,
     VideoSourceSelector,
 };
 use crate::recording::coordinator::GroupSnapshot;
@@ -85,6 +85,7 @@ impl AppState {
             RecordingConfig::new(format!("Recording {}", self.settings.recordings.len() + 1));
         self.selected = Some(recording.id);
         self.settings.recordings.push(recording);
+        self.resolve_resolution_defaults();
         self.dirty = true;
     }
 
@@ -131,6 +132,7 @@ impl AppState {
             draft.viewport = existing.viewport;
             self.replace_selected(draft, video_reselected);
         }
+        self.resolve_resolution_defaults();
         Ok(())
     }
 
@@ -150,6 +152,7 @@ impl AppState {
             }
             self.dirty = true;
         }
+        self.resolve_resolution_defaults();
     }
 
     pub fn remove(&mut self) {
@@ -172,6 +175,7 @@ impl AppState {
                 .map(|r| r.id);
             self.dirty = true;
         }
+        self.resolve_resolution_defaults();
     }
 
     pub fn replace_selected(&mut self, mut recording: RecordingConfig, video_reselected: bool) {
@@ -215,7 +219,11 @@ impl AppState {
         }
     }
 
-    pub fn apply_output(&mut self, id: RecordingId, output: OutputSettings) -> Result<(), String> {
+    pub fn apply_output(
+        &mut self,
+        id: RecordingId,
+        mut output: OutputSettings,
+    ) -> Result<(), String> {
         self.require_configuration_editable()?;
         output.validate_format()?;
         if !output.directory.is_absolute() {
@@ -227,6 +235,9 @@ impl AppState {
             .iter_mut()
             .find(|r| r.id == id)
             .ok_or("This recording no longer exists.")?;
+        if output.resolution != recording.output.resolution {
+            output.resolution_default_pending = false;
+        }
         if recording.output != output {
             recording.output = output;
             self.dirty = true;
@@ -337,7 +348,81 @@ impl AppState {
         summary
     }
 
-    pub fn update_catalog(&mut self, catalog: SourceCatalog) {
+    /// First configured video wins, even when unavailable; never substitute a later source.
+    pub fn first_source_resolution(&self) -> Option<Resolution> {
+        let first = self
+            .settings
+            .recordings
+            .iter()
+            .find(|recording| !matches!(recording.video, VideoSourceSelector::None))?;
+        if self.restored_windows.contains(&first.id) {
+            return None;
+        }
+        self.catalog.resolutions(&first.video).first().copied()
+    }
+
+    pub fn resolution_choices(&self) -> Vec<Resolution> {
+        let mut sizes = vec![
+            Resolution {
+                width: 640,
+                height: 480,
+            },
+            Resolution {
+                width: 1280,
+                height: 720,
+            },
+            Resolution {
+                width: 1920,
+                height: 1080,
+            },
+            Resolution {
+                width: 2560,
+                height: 1440,
+            },
+            Resolution {
+                width: 3840,
+                height: 2160,
+            },
+        ];
+        if let Some(first) = self
+            .settings
+            .recordings
+            .iter()
+            .find(|recording| !matches!(recording.video, VideoSourceSelector::None))
+            && !self.restored_windows.contains(&first.id)
+        {
+            sizes.extend(self.catalog.resolutions(&first.video));
+        }
+        if let Some(selected) = self.selected() {
+            if !self.restored_windows.contains(&selected.id) {
+                sizes.extend(self.catalog.resolutions(&selected.video));
+            }
+            sizes.push(selected.output.resolution);
+        }
+        crate::discovery::sort_resolutions(&mut sizes);
+        sizes
+    }
+
+    fn resolve_resolution_defaults(&mut self) -> bool {
+        if !self.configuration_editable() {
+            return false;
+        }
+        let Some(resolution) = self.first_source_resolution() else {
+            return false;
+        };
+        let mut changed = false;
+        for recording in &mut self.settings.recordings {
+            if recording.output.resolution_default_pending {
+                recording.output.resolution = resolution;
+                recording.output.resolution_default_pending = false;
+                changed = true;
+            }
+        }
+        self.dirty |= changed;
+        changed
+    }
+
+    pub fn update_catalog(&mut self, catalog: SourceCatalog) -> bool {
         self.catalog = catalog;
         for recording in &mut self.settings.recordings {
             self.catalog.revalidate(recording);
@@ -345,6 +430,7 @@ impl AppState {
                 recording.video_availability = SourceAvailability::Unavailable;
             }
         }
+        self.resolve_resolution_defaults()
     }
 
     pub fn needs_window_reselection(&self, id: RecordingId) -> bool {
@@ -551,6 +637,215 @@ mod tests {
     use super::*;
     use crate::model::WindowId;
 
+    fn resolution_catalog(first: &RecordingConfig, second: &RecordingConfig) -> SourceCatalog {
+        SourceCatalog {
+            videos: vec![second.video.clone(), first.video.clone()],
+            video_resolutions: vec![
+                (
+                    second.video.clone(),
+                    vec![Resolution {
+                        width: 3840,
+                        height: 2160,
+                    }],
+                ),
+                (
+                    first.video.clone(),
+                    vec![
+                        Resolution {
+                            width: 1280,
+                            height: 720,
+                        },
+                        Resolution {
+                            width: 2560,
+                            height: 1440,
+                        },
+                    ],
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn resolution_pair() -> (RecordingConfig, RecordingConfig) {
+        let mut first = RecordingConfig::new("First");
+        first.video = VideoSourceSelector::Camera {
+            device_id: crate::model::DeviceId("first".into()),
+            label: "Camera".into(),
+        };
+        let mut second = RecordingConfig::new("Second");
+        second.video = VideoSourceSelector::Camera {
+            device_id: crate::model::DeviceId("second".into()),
+            label: "Camera".into(),
+        };
+        (first, second)
+    }
+
+    #[test]
+    fn new_recordings_default_to_first_configured_video_not_discovery_or_selection_order() {
+        let (first, second) = resolution_pair();
+        let mut state = AppState::from_settings(PersistedSettings::default());
+        state.update_catalog(resolution_catalog(&first, &second));
+        state.apply_source_draft(first, true, true).unwrap();
+        state
+            .apply_source_draft(second.clone(), true, true)
+            .unwrap();
+        assert_eq!(state.selected, Some(second.id));
+        let expected = Resolution {
+            width: 2560,
+            height: 1440,
+        };
+        assert_eq!(state.first_source_resolution(), Some(expected));
+        for recording in &state.settings.recordings {
+            assert_eq!(recording.output.resolution, expected);
+            assert!(!recording.output.resolution_default_pending);
+        }
+        assert!(state.resolution_choices().contains(&Resolution {
+            width: 3840,
+            height: 2160
+        }));
+        state.duplicate();
+        assert_eq!(state.selected().unwrap().output.resolution, expected);
+    }
+
+    #[test]
+    fn delayed_discovery_resolves_once_and_never_falls_back_to_a_later_source() {
+        let (first, second) = resolution_pair();
+        let catalog = resolution_catalog(&first, &second);
+        let mut state = AppState::from_settings(PersistedSettings {
+            recordings: vec![first.clone(), second],
+            ..Default::default()
+        });
+        let mut missing = catalog.clone();
+        missing
+            .videos
+            .retain(|video| !crate::discovery::same_video(video, &first.video));
+        assert!(!state.update_catalog(missing));
+        assert_eq!(state.first_source_resolution(), None);
+        assert!(
+            state
+                .settings
+                .recordings
+                .iter()
+                .all(|r| r.output.resolution_default_pending)
+        );
+        assert!(state.update_catalog(catalog.clone()));
+        let outputs: Vec<_> = state
+            .settings
+            .recordings
+            .iter()
+            .map(|r| r.output.clone())
+            .collect();
+        let mut resized = catalog;
+        resized.video_resolutions[1].1 = vec![Resolution {
+            width: 4096,
+            height: 2160,
+        }];
+        assert!(!state.update_catalog(resized));
+        assert_eq!(
+            outputs,
+            state
+                .settings
+                .recordings
+                .iter()
+                .map(|r| r.output.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn custom_and_legacy_resolutions_survive_discovery_and_round_trip() {
+        let (mut first, mut second) = resolution_pair();
+        first.output.resolution_default_pending = false;
+        first.output.resolution = Resolution {
+            width: 1000,
+            height: 560,
+        };
+        second.output.directory = std::env::current_dir().unwrap();
+        let catalog = resolution_catalog(&first, &second);
+        let mut state = AppState::from_settings(PersistedSettings {
+            recordings: vec![first, second.clone()],
+            ..Default::default()
+        });
+        let mut custom = second.output.clone();
+        custom.resolution = Resolution {
+            width: 1600,
+            height: 900,
+        };
+        state.apply_output(second.id, custom).unwrap();
+        assert!(!state.update_catalog(catalog));
+        assert_eq!(
+            state.settings.recordings[0].output.resolution,
+            Resolution {
+                width: 1000,
+                height: 560
+            }
+        );
+        assert_eq!(
+            state.settings.recordings[1].output.resolution,
+            Resolution {
+                width: 1600,
+                height: 900
+            }
+        );
+        let path = tempfile::tempdir().unwrap();
+        save_settings(&path.path().join("settings.json"), &state.settings).unwrap();
+        let restored = AppState::load(&path.path().join("settings.json"));
+        for recording in restored.settings.recordings {
+            assert!(!recording.output.resolution_default_pending);
+        }
+    }
+
+    #[test]
+    fn discovery_never_changes_resolution_during_group_or_pending_start() {
+        for group in [
+            GroupState::Preparing,
+            GroupState::Recording,
+            GroupState::Paused,
+            GroupState::Finalizing,
+        ] {
+            let (first, second) = resolution_pair();
+            let catalog = resolution_catalog(&first, &second);
+            let mut state = AppState::from_settings(PersistedSettings {
+                recordings: vec![first, second],
+                ..Default::default()
+            });
+            state.group.state = group;
+            assert!(!state.update_catalog(catalog.clone()));
+            assert!(
+                state
+                    .settings
+                    .recordings
+                    .iter()
+                    .all(|r| r.output.resolution == Resolution::default())
+            );
+            state.group.state = GroupState::Idle;
+            state.start_pending = true;
+            assert!(!state.update_catalog(catalog.clone()));
+            state.start_pending = false;
+            assert!(state.update_catalog(catalog));
+        }
+    }
+
+    #[test]
+    fn unchanged_output_edits_keep_pending_but_explicit_same_size_override_clears_it() {
+        let (first, second) = resolution_pair();
+        let mut state = AppState::from_settings(PersistedSettings {
+            recordings: vec![first.clone()],
+            ..Default::default()
+        });
+        let mut output = first.output;
+        output.directory = std::env::current_dir().unwrap();
+        state.apply_output(first.id, output.clone()).unwrap();
+        assert!(state.selected().unwrap().output.resolution_default_pending);
+        output.resolution_default_pending = false;
+        state.apply_output(first.id, output).unwrap();
+        assert!(!state.update_catalog(resolution_catalog(state.selected().unwrap(), &second)));
+        assert_eq!(
+            state.selected().unwrap().output.resolution,
+            Resolution::default()
+        );
+    }
+
     fn ready_state() -> AppState {
         let mut state = AppState::from_settings(PersistedSettings::default());
         state.add();
@@ -564,6 +859,62 @@ mod tests {
         recording.audio_availability = SourceAvailability::Available;
         state.dirty = false;
         state
+    }
+
+    #[test]
+    fn restored_window_needs_reselection_before_its_size_can_be_a_default() {
+        let mut first = RecordingConfig::new("Window");
+        first.video = VideoSourceSelector::Window {
+            window_id: WindowId(42),
+            owner_bundle_id: None,
+            title: "Window".into(),
+        };
+        let (_, second) = resolution_pair();
+        let catalog = resolution_catalog(&first, &second);
+        let mut state = AppState::from_settings(PersistedSettings {
+            recordings: vec![first.clone(), second],
+            ..Default::default()
+        });
+        assert!(!state.update_catalog(catalog));
+        assert_eq!(state.first_source_resolution(), None);
+        state.apply_source_draft(first, false, true).unwrap();
+        assert_eq!(
+            state.first_source_resolution(),
+            Some(Resolution {
+                width: 2560,
+                height: 1440
+            })
+        );
+        assert!(
+            state
+                .settings
+                .recordings
+                .iter()
+                .all(|r| !r.output.resolution_default_pending)
+        );
+    }
+
+    #[test]
+    fn deleting_first_source_resolves_only_pending_outputs_from_the_new_first_source() {
+        let (first, second) = resolution_pair();
+        let mut catalog = resolution_catalog(&first, &second);
+        catalog
+            .videos
+            .retain(|video| !crate::discovery::same_video(video, &first.video));
+        let mut state = AppState::from_settings(PersistedSettings {
+            recordings: vec![first.clone(), second],
+            ..Default::default()
+        });
+        state.update_catalog(catalog);
+        state.remove_confirmed(first.id);
+        assert_eq!(
+            state.selected().unwrap().output.resolution,
+            Resolution {
+                width: 3840,
+                height: 2160
+            }
+        );
+        assert!(!state.selected().unwrap().output.resolution_default_pending);
     }
 
     fn assert_configuration_locked(state: &mut AppState) {

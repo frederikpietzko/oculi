@@ -17,7 +17,7 @@ use crate::render::RenderedFrame;
 const SIDEBAR: f64 = 240.0;
 const FOOTER: f64 = 100.0;
 const HEADER: f64 = 96.0;
-const DRAWER_OPEN: f64 = 232.0;
+const DRAWER_OPEN: f64 = 288.0;
 const DRAWER_CLOSED: f64 = 44.0;
 const GAP: f64 = 20.0;
 const GRID_INSET: f64 = 8.0;
@@ -46,6 +46,8 @@ pub(super) struct Workspace {
     pub width: Retained<NSTextField>,
     pub height: Retained<NSTextField>,
     pub fps: Retained<NSTextField>,
+    pub resolution: Retained<NSPopUpButton>,
+    pub resolution_hint: Retained<NSTextField>,
     pub status: Retained<NSTextField>,
     pub message: Retained<NSTextField>,
     pub edit_buttons: Vec<Retained<NSButton>>,
@@ -330,15 +332,35 @@ pub(super) fn build(delegate: &AppDelegate) -> Workspace {
     drawer_toggle.setBordered(false);
     let output_name = secondary(&root, "Select a recording", mtm);
     let drawer_body = view(&root, mtm);
-    let output_labels = ["Save to", "Filename template", "Width", "Height", "FPS"]
-        .into_iter()
-        .map(|value| secondary(&drawer_body, value, mtm))
-        .collect();
+    let output_labels = [
+        "Save to",
+        "Filename template",
+        "Width",
+        "Height",
+        "FPS",
+        "Resolution",
+    ]
+    .into_iter()
+    .map(|value| secondary(&drawer_body, value, mtm))
+    .collect();
     let directory = field(&drawer_body, delegate);
     let template = field(&drawer_body, delegate);
     let width = field(&drawer_body, delegate);
     let height = field(&drawer_body, delegate);
     let fps = field(&drawer_body, delegate);
+    let resolution = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        rect(0.0, 0.0, 1.0, 1.0),
+        false,
+    );
+    resolution.setAccessibilityLabel(Some(&ns("Output resolution")));
+    resolution.setToolTip(Some(&ns("Choose an output canvas size, or Custom for manual width and height. Source sizes are not encoder capability guarantees.")));
+    unsafe {
+        resolution.setTarget(Some(delegate));
+        resolution.setAction(Some(sel!(resolutionChanged:)));
+    }
+    drawer_body.addSubview(&resolution);
+    let resolution_hint = secondary(&drawer_body, "", mtm);
     for (field, name) in [
         (&directory, "Output directory"),
         (&template, "Filename template"),
@@ -399,6 +421,8 @@ pub(super) fn build(delegate: &AppDelegate) -> Workspace {
         width,
         height,
         fps,
+        resolution,
+        resolution_hint,
         status,
         message,
         edit_buttons: vec![
@@ -456,15 +480,10 @@ pub(super) fn refresh(delegate: &AppDelegate) {
     workspace
         .framing
         .setEnabled(state.can_save && state.selected().is_some());
-    for field in [
-        &workspace.directory,
-        &workspace.template,
-        &workspace.width,
-        &workspace.height,
-        &workspace.fps,
-    ] {
+    for field in [&workspace.directory, &workspace.template, &workspace.fps] {
         field.setEnabled(enabled);
     }
+    delegate.refresh_resolution_controls();
     for row in workspace.rows.borrow_mut().drain(..) {
         row.view.removeFromSuperview();
     }
@@ -637,6 +656,32 @@ pub(super) fn refresh_group(delegate: &AppDelegate) {
 }
 
 impl Workspace {
+    pub(super) fn smoke_check_output_layout(&self) {
+        let bounds = self.drawer_body.bounds();
+        for field in [
+            &self.directory,
+            &self.template,
+            &self.width,
+            &self.height,
+            &self.fps,
+        ] {
+            let frame = field.frame();
+            assert!(frame.origin.x >= 0.0 && frame.origin.y >= 0.0);
+            assert!(frame.origin.x + frame.size.width <= bounds.size.width);
+            assert!(frame.origin.y + frame.size.height <= bounds.size.height);
+        }
+        let popup = self.resolution.frame();
+        assert!(popup.origin.x + popup.size.width < self.width.frame().origin.x);
+        assert!(popup.origin.y + popup.size.height < self.template.frame().origin.y);
+        assert!(
+            self.template.frame().origin.y + self.template.frame().size.height
+                < self.directory.frame().origin.y
+        );
+        assert!(
+            self.grid_scroll.frame().origin.y
+                >= self.drawer.frame().origin.y + self.drawer.frame().size.height
+        );
+    }
     pub fn smoke_gpu_ready(&self, id: RecordingId) -> bool {
         self.cards
             .borrow()
@@ -771,15 +816,19 @@ impl Workspace {
             DRAWER_OPEN - DRAWER_CLOSED,
         ));
         let field_width = main_width - 48.0;
-        self.output_labels[0].setFrame(rect(24.0, 161.0, field_width, 18.0));
+        self.output_labels[0].setFrame(rect(24.0, 217.0, field_width, 18.0));
         self.directory
-            .setFrame(rect(24.0, 131.0, field_width - 112.0, 26.0));
+            .setFrame(rect(24.0, 187.0, field_width - 112.0, 26.0));
         self.choose
-            .setFrame(rect(main_width - 124.0, 129.0, 100.0, 30.0));
+            .setFrame(rect(main_width - 124.0, 185.0, 100.0, 30.0));
         let template_width = field_width - 276.0;
-        self.output_labels[1].setFrame(rect(24.0, 102.0, template_width, 18.0));
-        self.template
-            .setFrame(rect(24.0, 72.0, template_width, 26.0));
+        self.output_labels[1].setFrame(rect(24.0, 158.0, field_width, 18.0));
+        self.template.setFrame(rect(24.0, 128.0, field_width, 26.0));
+        self.output_labels[5].setFrame(rect(24.0, 102.0, template_width, 18.0));
+        self.resolution
+            .setFrame(rect(20.0, 70.0, template_width + 8.0, 30.0));
+        self.resolution_hint
+            .setFrame(rect(24.0, 48.0, field_width, 18.0));
         for (index, field) in [&self.width, &self.height, &self.fps]
             .into_iter()
             .enumerate()
@@ -789,10 +838,10 @@ impl Workspace {
             field.setFrame(rect(x, 72.0, 76.0, 26.0));
         }
         self.output_hint
-            .setFrame(rect(24.0, 45.0, field_width - 140.0, 18.0));
+            .setFrame(rect(24.0, 29.0, field_width - 140.0, 18.0));
         self.status
-            .setFrame(rect(24.0, 10.0, field_width - 140.0, 30.0));
-        self.status.setMaximumNumberOfLines(2);
+            .setFrame(rect(24.0, 6.0, field_width - 140.0, 20.0));
+        self.status.setMaximumNumberOfLines(1);
         self.status
             .setLineBreakMode(NSLineBreakMode::ByWordWrapping);
         self.apply

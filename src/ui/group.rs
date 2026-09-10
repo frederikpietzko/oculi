@@ -160,9 +160,10 @@ impl AppDelegate {
         for button in &c.edit_buttons {
             button.setEnabled(editable && state.selected().is_some());
         }
-        for field in [&c.directory, &c.template, &c.width, &c.height, &c.fps] {
+        for field in [&c.directory, &c.template, &c.fps] {
             field.setEnabled(editable && state.selected().is_some());
         }
+        self.refresh_resolution_controls();
         c.workspace
             .framing
             .setEnabled(state.can_save && state.selected().is_some());

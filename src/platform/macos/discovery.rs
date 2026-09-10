@@ -14,11 +14,11 @@
 use super::permissions;
 use crate::discovery::{SourceCatalog, same_audio, same_video};
 use crate::model::{
-    AudioSourceSelector, BundleId, DeviceId, DisplayId, VideoSourceSelector, WindowId,
+    AudioSourceSelector, BundleId, DeviceId, DisplayId, Resolution, VideoSourceSelector, WindowId,
 };
 use block2::RcBlock;
 use objc2::{
-    available,
+    AnyThread, available, msg_send,
     rc::{Retained, autoreleasepool},
     runtime::ProtocolObject,
 };
@@ -30,10 +30,13 @@ use objc2_av_foundation::{
     AVCaptureDeviceWasConnectedNotification, AVCaptureDeviceWasDisconnectedNotification,
     AVMediaTypeAudio, AVMediaTypeVideo,
 };
+use objc2_core_media::{
+    CMFormatDescription, CMVideoFormatDescriptionGetDimensions, kCMMediaType_Video,
+};
 use objc2_foundation::{
     NSArray, NSError, NSNotification, NSNotificationCenter, NSObjectProtocol, NSString,
 };
-use objc2_screen_capture_kit::SCShareableContent;
+use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
@@ -209,6 +212,7 @@ fn collect_parts(receiver: mpsc::Receiver<SourceCatalog>, deadline: Instant) -> 
         match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(part) => {
                 catalog.videos.extend(part.videos);
+                catalog.video_resolutions.extend(part.video_resolutions);
                 catalog.audios.extend(part.audios);
                 catalog.warnings.extend(part.warnings);
             }
@@ -229,6 +233,9 @@ fn collect_parts(receiver: mpsc::Receiver<SourceCatalog>, deadline: Instant) -> 
     }
     // Native enumeration and callback ordering can vary between refreshes.
     catalog.videos.sort_by_cached_key(|v| format!("{v:?}"));
+    catalog
+        .video_resolutions
+        .sort_by_cached_key(|(source, _)| format!("{source:?}"));
     catalog.audios.sort_by_cached_key(|a| format!("{a:?}"));
     catalog.warnings.sort();
     catalog
@@ -305,6 +312,29 @@ fn devices() -> SourceCatalog {
                 } else if camera {
                     let source = VideoSourceSelector::Camera { device_id, label };
                     if !catalog.videos.iter().any(|v| same_video(v, &source)) {
+                        let mut dimensions = BTreeSet::new();
+                        for format in device.formats() {
+                            // Borrowed from this worker-local format, as in device capture.
+                            let description: *const CMFormatDescription =
+                                msg_send![&*format, formatDescription];
+                            let Some(description) = description.as_ref() else {
+                                continue;
+                            };
+                            if description.media_type() != kCMMediaType_Video {
+                                continue;
+                            }
+                            let size = CMVideoFormatDescriptionGetDimensions(description);
+                            if size.width > 0 && size.height > 0 {
+                                dimensions.insert((size.width as u32, size.height as u32));
+                            }
+                        }
+                        catalog.video_resolutions.push((
+                            source.clone(),
+                            dimensions
+                                .into_iter()
+                                .map(|(width, height)| Resolution { width, height })
+                                .collect(),
+                        ));
                         catalog.videos.push(source);
                     }
                 } else {
@@ -412,6 +442,33 @@ struct Window {
     on_screen: bool,
 }
 
+fn pixel_resolution(width: f64, height: f64, scale: f64) -> Option<Resolution> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let pixels = |points: f64| {
+        let value = (points * scale).round();
+        (points.is_finite() && points > 0.0 && value >= 1.0 && value <= f64::from(u32::MAX))
+            .then_some(value as u32)
+    };
+    Some(Resolution {
+        width: pixels(width)?,
+        height: pixels(height)?,
+    })
+}
+
+fn filter_resolution(filter: &SCContentFilter) -> Option<Resolution> {
+    if !available!(macos = 14.0) {
+        return None;
+    }
+    // SAFETY: Only metadata is read from a callback-local filter; no stream is
+    // created. contentRect is in points, including on Retina displays.
+    unsafe {
+        let size = filter.contentRect().size;
+        pixel_resolution(size.width, size.height, f64::from(filter.pointPixelScale()))
+    }
+}
+
 fn screen_catalog(content: &SCShareableContent) -> SourceCatalog {
     let mut catalog = SourceCatalog::default();
     let mut displays = Vec::new();
@@ -424,7 +481,7 @@ fn screen_catalog(content: &SCShareableContent) -> SourceCatalog {
         for display in content.displays().iter() {
             let id = DisplayId(display.displayID());
             displays.push((id, Rect::from(display.frame())));
-            catalog.videos.push(VideoSourceSelector::Display {
+            let source = VideoSourceSelector::Display {
                 display_id: id,
                 label: format!(
                     "Display {} ({} × {})",
@@ -432,7 +489,18 @@ fn screen_catalog(content: &SCShareableContent) -> SourceCatalog {
                     display.width(),
                     display.height()
                 ),
-            });
+            };
+            let filter = SCContentFilter::initWithDisplay_excludingWindows(
+                SCContentFilter::alloc(),
+                &display,
+                &NSArray::new(),
+            );
+            if let Some(resolution) = filter_resolution(&filter) {
+                catalog
+                    .video_resolutions
+                    .push((source.clone(), vec![resolution]));
+            }
+            catalog.videos.push(source);
         }
         for app in content.applications().iter() {
             applications.push(Application {
@@ -463,14 +531,24 @@ fn screen_catalog(content: &SCShareableContent) -> SourceCatalog {
                 frame: window.frame().into(),
                 on_screen: window.isOnScreen(),
             });
-            catalog.videos.push(VideoSourceSelector::Window {
+            let source = VideoSourceSelector::Window {
                 window_id: WindowId(window.windowID()),
                 owner_bundle_id: bundle.map(BundleId),
                 title: window
                     .title()
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| format!("Window {}", window.windowID())),
-            });
+            };
+            let filter = SCContentFilter::initWithDesktopIndependentWindow(
+                SCContentFilter::alloc(),
+                &window,
+            );
+            if let Some(resolution) = filter_resolution(&filter) {
+                catalog
+                    .video_resolutions
+                    .push((source.clone(), vec![resolution]));
+            }
+            catalog.videos.push(source);
         }
     }
     // Shareable content need not include another instance with no windows.
@@ -558,11 +636,21 @@ fn add_applications(
                 .iter()
                 .any(|w| w.pid == pid && w.on_screen && w.frame.intersects(*frame))
             {
-                catalog.videos.push(VideoSourceSelector::Application {
+                let source = VideoSourceSelector::Application {
                     bundle_id: BundleId(bundle.clone()),
                     display_id: *display_id,
                     label: format!("{label} — Display {}", display_id.0),
-                });
+                };
+                // Application capture uses a display-scoped canvas, not the
+                // bounding box of its windows or a different display's scale.
+                if let Some((_, resolutions)) = catalog.video_resolutions.iter().find(|(v, _)| {
+                    matches!(v, VideoSourceSelector::Display { display_id: id, .. } if id == display_id)
+                }) {
+                    catalog
+                        .video_resolutions
+                        .push((source.clone(), resolutions.clone()));
+                }
+                catalog.videos.push(source);
             }
         }
     }
@@ -573,16 +661,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pixel_dimensions_apply_retina_scale_without_encoder_rounding() {
+        assert_eq!(
+            pixel_resolution(1512.0, 982.0, 2.0),
+            Some(Resolution {
+                width: 3024,
+                height: 1964,
+            })
+        );
+        assert_eq!(
+            pixel_resolution(500.5, 300.5, 2.0),
+            Some(Resolution {
+                width: 1001,
+                height: 601,
+            })
+        );
+        assert_eq!(
+            pixel_resolution(1920.0, 1080.0, 1.0),
+            Some(Resolution {
+                width: 1920,
+                height: 1080,
+            })
+        );
+        assert_eq!(
+            pixel_resolution(500.499999, 300.500001, 2.0),
+            pixel_resolution(500.5, 300.5, 2.0)
+        );
+    }
+
+    #[test]
+    fn pixel_dimensions_reject_invalid_or_unrepresentable_metadata() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(pixel_resolution(invalid, 100.0, 2.0), None);
+            assert_eq!(pixel_resolution(100.0, invalid, 2.0), None);
+            assert_eq!(pixel_resolution(100.0, 100.0, invalid), None);
+        }
+        assert_eq!(pixel_resolution(0.1, 100.0, 1.0), None);
+        assert_eq!(pixel_resolution(f64::from(u32::MAX), 100.0, 2.0), None);
+        assert_eq!(pixel_resolution(100.0, f64::MAX, 2.0), None);
+        assert_eq!(
+            pixel_resolution(f64::from(u32::MAX), 1.0, 1.0),
+            Some(Resolution {
+                width: u32::MAX,
+                height: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn completed_workers_merge_resolution_metadata() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let sources = [
+            VideoSourceSelector::Camera {
+                device_id: DeviceId("camera".into()),
+                label: "Camera".into(),
+            },
+            VideoSourceSelector::Display {
+                display_id: DisplayId(1),
+                label: "Display".into(),
+            },
+        ];
+        let resolutions = vec![Resolution {
+            width: 1920,
+            height: 1080,
+        }];
+        for source in &sources {
+            sender
+                .try_send(SourceCatalog {
+                    videos: vec![source.clone()],
+                    video_resolutions: vec![(source.clone(), resolutions.clone())],
+                    ..SourceCatalog::default()
+                })
+                .unwrap();
+        }
+        let catalog = collect_parts(receiver, Instant::now());
+        assert!(catalog.warnings.is_empty());
+        assert_eq!(catalog.video_resolutions.len(), 2);
+        for source in sources {
+            assert!(catalog.videos.contains(&source));
+            assert!(
+                catalog
+                    .video_resolutions
+                    .contains(&(source, resolutions.clone()))
+            );
+        }
+    }
+
+    #[test]
     fn timeout_preserves_partial_results() {
         let (sender, receiver) = mpsc::sync_channel(2);
+        let metadata = vec![(
+            VideoSourceSelector::Display {
+                display_id: DisplayId(1),
+                label: "Display".into(),
+            },
+            vec![Resolution {
+                width: 3024,
+                height: 1964,
+            }],
+        )];
         sender
             .try_send(SourceCatalog {
                 audios: vec![AudioSourceSelector::System],
+                video_resolutions: metadata.clone(),
                 ..SourceCatalog::default()
             })
             .unwrap();
         let catalog = collect_parts(receiver, Instant::now());
         assert_eq!(catalog.audios, vec![AudioSourceSelector::System]);
+        assert_eq!(catalog.video_resolutions, metadata);
         assert!(catalog.warnings.iter().any(|w| w.contains("timed out")));
     }
 
@@ -624,6 +811,19 @@ mod tests {
             height: 100.0,
         };
         let mut catalog = SourceCatalog::default();
+        let resolutions = vec![Resolution {
+            width: 200,
+            height: 200,
+        }];
+        for (id, resolution) in [(1, resolutions.clone()), (2, vec![])] {
+            catalog.video_resolutions.push((
+                VideoSourceSelector::Display {
+                    display_id: DisplayId(id),
+                    label: "Display".into(),
+                },
+                resolution,
+            ));
+        }
         add_applications(
             &mut catalog,
             vec![
@@ -650,6 +850,11 @@ mod tests {
         assert_eq!(catalog.videos.len(), 1);
         assert!(
             matches!(&catalog.videos[0], VideoSourceSelector::Application { bundle_id, display_id: DisplayId(1), .. } if bundle_id.0 == "unique")
+        );
+        assert_eq!(catalog.video_resolutions.len(), 3);
+        assert_eq!(
+            catalog.video_resolutions[2],
+            (catalog.videos[0].clone(), resolutions)
         );
         assert!(catalog.warnings.iter().any(|w| w.contains("ambiguous")));
         assert!(!catalog.audios.iter().any(|a| matches!(a, AudioSourceSelector::Application { bundle_id, .. } if bundle_id.0 == "own" || bundle_id.0 == "ambiguous")));
