@@ -5,6 +5,13 @@ fn main() {
         let mut args = std::env::args_os().skip(1);
         let smoke_directory = match args.next() {
             None => None,
+            Some(arg) if arg == "--device-smoke-test" => {
+                let report = args
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .expect("--device-smoke-test requires a new report file path");
+                std::process::exit(device_smoke(report));
+            }
             Some(arg) if arg == "--smoke-test" => {
                 let root = args
                     .next()
@@ -18,7 +25,9 @@ fn main() {
                 Some(directory)
             }
             Some(_) => {
-                eprintln!("Usage: oculi [--smoke-test OUTPUT_DIRECTORY]");
+                eprintln!(
+                    "Usage: oculi [--smoke-test OUTPUT_DIRECTORY | --device-smoke-test REPORT_FILE]"
+                );
                 std::process::exit(2);
             }
         };
@@ -26,4 +35,49 @@ fn main() {
     }
     #[cfg(not(target_os = "macos"))]
     eprintln!("Oculi requires macOS 15 or later.");
+}
+
+#[cfg(target_os = "macos")]
+fn device_smoke(path: std::path::PathBuf) -> i32 {
+    use std::io::Write;
+
+    let mut report = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create a new device smoke report (existing files are never overwritten)");
+    let bundle = objc2_foundation::NSBundle::mainBundle();
+    writeln!(
+        report,
+        "Bundle: {:?}\nExecutable: {:?}\nNo permission prompts, settings changes, or media files.",
+        bundle.bundleIdentifier().map(|id| id.to_string()),
+        std::env::current_exe()
+    )
+    .expect("write smoke identity");
+    report.flush().expect("flush smoke identity");
+    // Device session setup/teardown stays off the AppKit main thread.
+    std::thread::spawn(move || {
+        let mut exit_code = 0;
+        for camera in [true, false] {
+            let message = match oculi::platform::macos::device_capture::smoke_check(camera) {
+                Ok(message) => {
+                    if message.starts_with("SKIP") && exit_code == 0 {
+                        exit_code = 2;
+                    }
+                    message
+                }
+                Err(error) => {
+                    exit_code = 1;
+                    format!("FAIL {error}")
+                }
+            };
+            writeln!(report, "{message}").expect("write device result");
+            report.flush().expect("flush device result");
+        }
+        writeln!(report, "COMPLETE exit_code={exit_code}").expect("write completion");
+        report.sync_all().expect("sync smoke report");
+        exit_code
+    })
+    .join()
+    .unwrap_or(1)
 }

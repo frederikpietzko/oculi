@@ -19,6 +19,7 @@ use objc2_foundation::{
 use crate::app::{AppState, SettingsWorker};
 use crate::discovery::{SourceCatalog, same_audio, same_video};
 use crate::model::{AudioSourceSelector, RecordingConfig, VideoSourceSelector};
+use crate::platform::macos::capture::CaptureWorker;
 use crate::platform::macos::{discovery, permissions};
 use crate::storage::default_settings_path;
 use source_picker::*;
@@ -45,6 +46,7 @@ struct Controls {
 struct DelegateIvars {
     state: RefCell<AppState>,
     saver: RefCell<SettingsWorker>,
+    capture: RefCell<CaptureWorker>,
     controls: OnceCell<Controls>,
     videos: RefCell<Vec<VideoSourceSelector>>,
     audios: RefCell<Vec<AudioSourceSelector>>,
@@ -84,6 +86,9 @@ define_class!(
             let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.2, self, sel!(tick:), None, true,
             ) };
+            // TerminateLater enters a modal run loop; persistence/capture polling
+            // must continue there until the asynchronous quit reply is ready.
+            unsafe { objc2_foundation::NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode); }
             *self.ivars().timer.borrow_mut() = Some(timer);
         }
 
@@ -98,7 +103,8 @@ define_class!(
             }
             if !self.commit_editor(false) { return NSApplicationTerminateReply::TerminateCancel; }
             self.save();
-            if self.ivars().saver.borrow().pending || self.ivars().state.borrow().dirty {
+            self.ivars().capture.borrow().shutdown();
+            if self.ivars().saver.borrow().pending || self.ivars().state.borrow().dirty || !self.ivars().capture.borrow().is_finished() {
                 self.ivars().quitting.set(true);
                 NSApplicationTerminateReply::TerminateLater
             } else { NSApplicationTerminateReply::TerminateNow }
@@ -106,6 +112,7 @@ define_class!(
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
+            self.ivars().capture.borrow().shutdown();
             if let Some(timer) = self.ivars().timer.borrow_mut().take() { timer.invalidate(); }
         }
     }
@@ -167,14 +174,21 @@ define_class!(
             }
             // New edits made during a save are sent once that save completes.
             if !self.ivars().saver.borrow().failed { self.save(); }
-            if self.ivars().quitting.get() && !self.ivars().saver.borrow().pending && !self.ivars().state.borrow().dirty {
+            self.poll_capture();
+            if self.ivars().quitting.get() && !self.ivars().saver.borrow().pending && !self.ivars().state.borrow().dirty && self.ivars().capture.borrow().is_finished() {
                 NSApplication::sharedApplication(self.mtm()).replyToApplicationShouldTerminate(true);
             }
             self.refresh_status();
             if self.ivars().smoke_directory.is_some() && !self.ivars().smoke_started.get() { self.smoke_actions(); }
-            if self.ivars().smoke_started.get() && !self.ivars().saver.borrow().pending && !self.ivars().state.borrow().dirty {
+            if self.ivars().smoke_started.get() && !self.ivars().quitting.get() && !self.ivars().saver.borrow().pending && !self.ivars().state.borrow().dirty {
                 println!("Oculi native UI smoke: PASS (source dialogs, cancel, edit, cards, output validation, deletion confirmation, settings window, resize, asynchronous save)");
-                NSApplication::sharedApplication(self.mtm()).terminate(None);
+                self.ivars().quitting.set(true);
+                // Do not nest termination inside this timer: NSTimer cannot fire
+                // again until this invocation returns, including during a modal quit.
+                dispatch2::DispatchQueue::main().exec_async(|| {
+                    let mtm = MainThreadMarker::new().expect("main dispatch queue");
+                    NSApplication::sharedApplication(mtm).terminate(None);
+                });
             }
         }
 
@@ -267,7 +281,10 @@ define_class!(
         }
 
         #[unsafe(method(refreshSources:))]
-        fn refresh_sources(&self, _sender: &NSButton) { self.begin_refresh(); }
+        fn refresh_sources(&self, _sender: &NSButton) {
+            self.ivars().capture.borrow_mut().retry();
+            self.begin_refresh();
+        }
 
         #[unsafe(method(requestCamera:))]
         fn request_camera(&self, _sender: &NSButton) { permissions::request_camera(); }
@@ -294,6 +311,7 @@ impl AppDelegate {
         let this = Self::alloc(mtm).set_ivars(DelegateIvars {
             state: RefCell::new(state),
             saver: RefCell::new(SettingsWorker::new(path)),
+            capture: RefCell::new(CaptureWorker::new()),
             controls: OnceCell::new(),
             videos: RefCell::new(Vec::new()),
             audios: RefCell::new(Vec::new()),
@@ -770,6 +788,26 @@ impl AppDelegate {
         workspace::refresh(self);
     }
 
+    fn poll_capture(&self) {
+        let mut worker = self.ivars().capture.borrow_mut();
+        // A failed settings save can cancel termination after capture has stopped.
+        if !self.ivars().quitting.get() && worker.is_stopping() && worker.is_finished() {
+            *worker = CaptureWorker::new();
+        }
+        if !self.ivars().quitting.get() {
+            let targets = if self.ivars().smoke_directory.is_some() {
+                Vec::new()
+            } else {
+                self.ivars().state.borrow().capture_targets()
+            };
+            worker.update(targets);
+        }
+        if let Some(snapshot) = worker.poll() {
+            self.ivars().state.borrow_mut().capture = snapshot;
+            workspace::refresh_capture(self);
+        }
+    }
+
     fn refresh_status(&self) {
         let Some(c) = self.ivars().controls.get() else {
             return;
@@ -779,10 +817,7 @@ impl AppDelegate {
             Some(r) if state.needs_window_reselection(r.id) => {
                 "Reselect this window: saved window IDs are not stable across app launches.".into()
             }
-            Some(r) => format!(
-                "Video: {:?}  ·  Audio: {:?}",
-                r.video_availability, r.audio_availability
-            ),
+            Some(r) => state.capture_summary(r.id),
             None => "Add a recording to select its video, audio and destination.".into(),
         };
         c.status.setStringValue(&ns(&status));
@@ -790,8 +825,16 @@ impl AppDelegate {
         if !state.catalog.warnings.is_empty() {
             guidance.push_str(&format!("\n{}", state.catalog.warnings.join("\n")));
         }
+        if !state.capture.shutdown_errors.is_empty() {
+            guidance.push_str(&format!("\n{}", state.capture.shutdown_errors.join("\n")));
+        }
         c.guidance.setStringValue(&ns(&guidance));
-        c.message.setStringValue(&ns(&state.message));
+        c.message
+            .setStringValue(&ns(if self.ivars().quitting.get() {
+                "Stopping capture and saving settings…"
+            } else {
+                &state.message
+            }));
     }
 
     fn button(

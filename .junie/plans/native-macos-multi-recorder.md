@@ -141,7 +141,7 @@ Prioritize UI structure before capture; existing saved configuration compatibili
 - Move global settings into a separate window accessible from the application menu bar.
 - Verify configuration dialogs, selection, deletion confirmation, output validation, and native layout with automated tests and the app smoke check.
 
-### * Step 3: Implement shared video and audio capture
+### ✓ Step 3: Implement shared video and audio capture
 Multiple recording configurations can consume shared native capture sources without blocking the interface.
 - Implement ScreenCaptureKit window/display/application capture and independent application/system audio selection.
 - Implement AVFoundation camera and audio-input capture adapters.
@@ -149,7 +149,7 @@ Multiple recording configurations can consume shared native capture sources with
 - Propagate permission changes, source loss, device contention, and stream errors to application state.
 - Test shared-source reuse, teardown, slow subscribers, and permission-gated adapter capture.
 
-###   Step 4: Add live previews and single-source viewport editing
+### * Step 4: Add live previews and single-source viewport editing
 Each recording previews its own editable crop and framing before and during capture.
 - Implement GPU-backed rendering and native previews in `render` and `ui/viewport.rs`.
 - Add drag/resize/crop/zoom, numeric placement, fit/fill/reset, and fixed-canvas output settings.

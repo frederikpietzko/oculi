@@ -145,6 +145,7 @@ checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.2",
  "block2",
+ "libc",
  "objc2",
 ]
 
@@ -463,6 +464,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05ec576860167a15dd9fce7fbee7512beb4e31f532159d3482d1f9c6caedf31d"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
  "dispatch2",
  "objc2",
  "objc2-core-audio",
@@ -490,10 +492,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-io-surface",
+ "objc2-metal",
 ]
 
 [[package]]
@@ -605,6 +609,7 @@ name = "oculi"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "dispatch2",
  "env_logger",
  "log",
  "objc2",
@@ -612,6 +617,8 @@ dependencies = [
  "objc2-av-foundation",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-core-media",
+ "objc2-core-video",
  "objc2-foundation",
  "objc2-screen-capture-kit",
  "serde",

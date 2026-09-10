@@ -1,4 +1,4 @@
-//! Native configuration workspace. Capture and live preview are intentionally absent.
+//! Native workspace with capture diagnostics; live preview is a separate stage.
 
 use std::cell::RefCell;
 
@@ -10,7 +10,6 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use super::source_picker::{audio_title, video_title};
 use super::{AppDelegate, label, ns, rect};
-use crate::model::SourceAvailability;
 
 const SIDEBAR: f64 = 240.0;
 const FOOTER: f64 = 100.0;
@@ -441,7 +440,7 @@ pub(super) fn refresh(delegate: &AppDelegate) {
     }
     let count = state.settings.recordings.len();
     workspace.count.setStringValue(&ns(&format!(
-        "{count} recording {}  ·  Configuration only",
+        "{count} recording {}  ·  No files are being recorded",
         if count == 1 { "pair" } else { "pairs" }
     )));
     workspace.empty_title.setHidden(count != 0);
@@ -455,8 +454,6 @@ pub(super) fn refresh(delegate: &AppDelegate) {
         .setToolTip(Some(&workspace.output_name.stringValue()));
     for (index, recording) in state.settings.recordings.iter().enumerate() {
         let selected = Some(recording.id) == state.selected;
-        let ready = recording.video_availability == SourceAvailability::Available
-            && recording.audio_availability == SourceAvailability::Available;
         let row_view = view(&workspace.list, mtm);
         let row_color = if selected {
             NSColor::selectedContentBackgroundColor()
@@ -466,15 +463,7 @@ pub(super) fn refresh(delegate: &AppDelegate) {
         let background = panel(&row_view, &row_color, mtm);
         background.setCornerRadius(8.0);
         let title = text(&row_view, &recording.name, 13.0, true, mtm);
-        let detail = secondary(
-            &row_view,
-            if ready {
-                "Sources available"
-            } else {
-                "Sources need attention"
-            },
-            mtm,
-        );
+        let detail = secondary(&row_view, &state.capture_summary(recording.id), mtm);
         if selected {
             title.setTextColor(Some(&NSColor::alternateSelectedControlTextColor()));
             detail.setTextColor(Some(&NSColor::alternateSelectedControlTextColor()));
@@ -565,6 +554,30 @@ pub(super) fn layout(delegate: &AppDelegate) {
         controls
             .workspace
             .set_frames(delegate.ivars().drawer_open.get());
+    }
+}
+
+pub(super) fn refresh_capture(delegate: &AppDelegate) {
+    let workspace = &delegate.controls().workspace;
+    let state = delegate.ivars().state.borrow();
+    for (recording, row) in state
+        .settings
+        .recordings
+        .iter()
+        .zip(workspace.rows.borrow().iter())
+    {
+        let summary = ns(&state.capture_summary(recording.id));
+        row.detail.setStringValue(&summary);
+        row.detail.setToolTip(Some(&summary));
+    }
+    for (recording, card) in state
+        .settings
+        .recordings
+        .iter()
+        .zip(workspace.cards.borrow().iter())
+    {
+        card.placeholder
+            .setToolTip(Some(&ns(&state.capture_summary(recording.id))));
     }
 }
 

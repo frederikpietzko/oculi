@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 
+use crate::capture::service::{CaptureSnapshot, CaptureState, CaptureTarget};
+use crate::capture::{CaptureFormat, CaptureRequest, SourceKey};
 use crate::discovery::SourceCatalog;
 use crate::model::{RecordingConfig, RecordingId, SourceAvailability, VideoSourceSelector};
 use crate::storage::{PersistedSettings, ensure_writable_directory, load_settings, save_settings};
@@ -15,6 +17,7 @@ pub struct AppState {
     pub message: String,
     pub can_save: bool,
     pub dirty: bool,
+    pub capture: CaptureSnapshot,
     restored_windows: HashSet<RecordingId>,
 }
 
@@ -52,6 +55,7 @@ impl AppState {
             message: String::new(),
             can_save: true,
             dirty: false,
+            capture: CaptureSnapshot::default(),
             restored_windows,
         }
     }
@@ -186,6 +190,100 @@ impl AppState {
     pub fn needs_window_reselection(&self, id: RecordingId) -> bool {
         self.restored_windows.contains(&id)
     }
+
+    pub fn capture_targets(&self) -> Vec<CaptureTarget> {
+        let mut targets = Vec::new();
+        for recording in &self.settings.recordings {
+            if recording.output.validate_format().is_err() {
+                continue;
+            }
+            if recording.video_availability == SourceAvailability::Available
+                && let Some(source) = SourceKey::video(&recording.video)
+            {
+                targets.push(CaptureTarget {
+                    recording: recording.id,
+                    request: CaptureRequest {
+                        source,
+                        format: CaptureFormat::Video {
+                            width: recording.output.resolution.width,
+                            height: recording.output.resolution.height,
+                            fps: recording.output.fps,
+                        },
+                    },
+                });
+            }
+            if recording.audio_availability == SourceAvailability::Available
+                && let Some(source) = SourceKey::audio(&recording.audio)
+            {
+                targets.push(CaptureTarget {
+                    recording: recording.id,
+                    request: CaptureRequest {
+                        source,
+                        format: CaptureFormat::Audio {
+                            sample_rate: 48_000,
+                            channels: 2,
+                        },
+                    },
+                });
+            }
+        }
+        targets
+    }
+
+    pub fn capture_summary(&self, id: RecordingId) -> String {
+        let Some(recording) = self.settings.recordings.iter().find(|r| r.id == id) else {
+            return String::new();
+        };
+        if let Err(error) = recording.output.validate_format() {
+            return error;
+        }
+        let video = SourceKey::video(&recording.video);
+        let audio = SourceKey::audio(&recording.audio);
+        let states: Vec<_> = self
+            .capture
+            .statuses
+            .iter()
+            .filter(|s| {
+                s.recording == id
+                    && (Some(&s.source) == video.as_ref() || Some(&s.source) == audio.as_ref())
+            })
+            .collect();
+        let errors: Vec<_> = states
+            .iter()
+            .filter_map(|s| match &s.state {
+                CaptureState::Failed(error) => Some(error.to_string()),
+                _ => None,
+            })
+            .collect();
+        if !errors.is_empty() {
+            return errors.join("; ");
+        }
+        if recording.video_availability != SourceAvailability::Available
+            || recording.audio_availability != SourceAvailability::Available
+        {
+            return "Sources unavailable — check selection and permissions".into();
+        }
+        let receiving = states
+            .iter()
+            .filter(|s| matches!(s.state, CaptureState::Receiving { .. }))
+            .count();
+        let dropped: u64 = states
+            .iter()
+            .map(|s| match s.state {
+                CaptureState::Receiving { dropped, .. } => dropped,
+                _ => 0,
+            })
+            .sum();
+        if receiving == 2 {
+            if dropped > 0 {
+                format!("Capture active · {dropped} skipped samples (preview only)")
+            } else {
+                "Video + audio capture active · preview coming next".into()
+            }
+        } else {
+            format!("Waiting for source samples ({receiving}/2) · not recording")
+        }
+    }
 }
 
 pub struct SaveResult {
@@ -292,6 +390,51 @@ impl SettingsWorker {
 mod tests {
     use super::*;
     use crate::model::WindowId;
+
+    #[test]
+    fn capture_demand_excludes_unavailable_sources_without_substitution() {
+        let mut state = AppState::from_settings(PersistedSettings::default());
+        state.add();
+        let r = &mut state.settings.recordings[0];
+        r.video = VideoSourceSelector::Display {
+            display_id: crate::model::DisplayId(12),
+            label: "Display".into(),
+        };
+        r.audio = crate::model::AudioSourceSelector::System;
+        r.video_availability = SourceAvailability::Available;
+        r.audio_availability = SourceAvailability::Unavailable;
+        let targets = state.capture_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].request.source, SourceKey::Display(12));
+        state.settings.recordings[0].video_availability = SourceAvailability::Unavailable;
+        assert!(state.capture_targets().is_empty());
+        assert!(matches!(
+            state.settings.recordings[0].video,
+            VideoSourceSelector::Display { .. }
+        ));
+    }
+
+    #[test]
+    fn native_failures_are_visible_per_recording_and_ignore_obsolete_sources() {
+        let mut state = AppState::from_settings(PersistedSettings::default());
+        state.add();
+        let r = &mut state.settings.recordings[0];
+        let id = r.id;
+        r.audio = crate::model::AudioSourceSelector::System;
+        state
+            .capture
+            .statuses
+            .push(crate::capture::service::CaptureStatus {
+                recording: id,
+                source: SourceKey::SystemAudio,
+                state: CaptureState::Failed(crate::capture::CaptureError::Permission(
+                    "Screen & System Audio Recording".into(),
+                )),
+            });
+        assert!(state.capture_summary(id).contains("Permission required"));
+        state.settings.recordings[0].audio = crate::model::AudioSourceSelector::None;
+        assert!(!state.capture_summary(id).contains("Permission required"));
+    }
 
     #[test]
     fn source_drafts_are_transactional_and_reject_invalid_names() {
