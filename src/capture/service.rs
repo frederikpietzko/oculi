@@ -165,12 +165,19 @@ impl<T: Clone + Send + 'static, B: CaptureBackend<T>> CaptureService<T, B> {
     }
 
     pub fn poll(&mut self) -> CaptureSnapshot {
+        self.poll_with(|_, _| {})
+    }
+
+    /// Observe accepted samples on the service worker, never on capture callbacks.
+    /// Observers must only hand off bounded work, not render or encode inline.
+    pub fn poll_with(&mut self, mut receive: impl FnMut(&CaptureTarget, T)) -> CaptureSnapshot {
         for active in &mut self.active {
             for _ in 0..256 {
-                if active.lease.try_recv().is_none() {
+                let Some(sample) = active.lease.try_recv() else {
                     break;
-                }
+                };
                 active.samples += 1;
+                receive(&active.target, sample);
             }
             if let Some(error) = active.lease.error() {
                 self.failures
@@ -362,6 +369,39 @@ mod tests {
         assert_eq!(service.poll().active_sessions, 1);
         assert_eq!(service.shutdown().active_sessions, 0);
         assert_eq!(state.borrow().stops, 1);
+    }
+
+    #[test]
+    fn sample_handoff_keeps_latest_video_and_drains_all_audio_without_new_sessions() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(FakeState::default()));
+        let mut service = CaptureService::new(Backend(state.clone()));
+        let a = video(1920);
+        let b = video(1920);
+        let audio = target(
+            SourceKey::SystemAudio,
+            CaptureFormat::Audio {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        );
+        service.reconcile(1, vec![a.clone(), b.clone(), audio.clone()], false);
+        for sample in 0..10 {
+            state.borrow().publishers[0].publish(sample);
+            state.borrow().publishers[1].publish(sample);
+        }
+        let mut delivered = HashMap::<RecordingId, Vec<u64>>::new();
+        let snapshot = service.poll_with(|target, sample| {
+            delivered.entry(target.recording).or_default().push(sample);
+        });
+        assert_eq!(snapshot.active_sessions, 2);
+        assert_eq!(delivered[&a.recording], vec![9]);
+        assert_eq!(delivered[&b.recording], vec![9]);
+        assert_eq!(delivered[&audio.recording], (0..10).collect::<Vec<_>>());
+        assert_eq!(state.borrow().starts.len(), 2);
+        let mut extra = 0;
+        service.poll_with(|_, _| extra += 1);
+        assert_eq!(extra, 0);
+        service.shutdown();
     }
 
     #[test]

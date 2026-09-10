@@ -8,8 +8,10 @@ The native workspace shows every configured video/audio pair as a preview card,
 with a source sidebar and a collapsible recording-output drawer. Add/edit dialogs,
 delete confirmation, source discovery, destination settings and persistence work.
 Shared native video/audio capture runs on a background worker, with per-recording
-status and bounded sample delivery. **Live previews, viewport editing, media encoding
-and group recording controls are not implemented yet. This build does not record files.**
+status and bounded sample delivery. Live Metal previews and independent single-source
+framing are implemented. Independent H.264/AAC MP4 writers share one group timeline,
+with bounded queues, pause trimming, and collision-safe output publication.
+Group controls coordinate preflight, recording, and asynchronous Stop & Save.
 
 ## Build and launch
 
@@ -32,12 +34,20 @@ ad-hoc signed, not notarized. The script sets the macOS 15 deployment target.
   resolution and FPS in the bottom **Recording output** drawer. **Apply Output**
   saves changes; Return, switching sources and quitting also apply valid output
   edits. Collapse the drawer to make more room for the card grid.
-- Preview cards are labeled placeholders, not live video. The group-wide
-  **Start / Pause / Stop & Save** buttons remain disabled until encoding and
-  recording are implemented. They are not individual recording controls.
+- Preview cards show live, independently framed video. **Framing…** opens a larger
+  editor: drag to reposition, drag a corner to resize, Option-drag a corner to crop,
+  and scroll to zoom. Numeric controls plus Fit / Fill / Reset are also available.
+  Crop is normalized to the source; offsets are fractions of the fixed output canvas.
+  Framing changes are saved without restarting capture. Handles are separate native
+  overlays and never part of the clean rendered surface.
+- **Start** preflights every configured pair before committing a common start.
+  **Pause / Resume** omit paused time while previews keep running. **Stop & Save**
+  finishes every output asynchronously. These controls always operate on the group.
+  Source/output settings are locked while active; selection and framing remain editable.
+  A required source or writer failure stops the group and attempts partial finalization.
 - Available configured sources begin capture automatically while Oculi is open;
-  macOS may show camera, microphone, or screen-capture indicators. No media is
-  written or played back. Delete a configuration to release its subscriptions;
+  macOS may show camera, microphone, or screen-capture indicators. Media is only
+  written after Start; there is no audible monitoring. Delete an idle configuration to release its subscriptions;
   a shared source stops when its last subscriber leaves. Quitting stops all sources.
 - The sidebar and output drawer show capture status. **Refresh Sources** explicitly
   retries failed captures; periodic discovery does not continuously retry a busy
@@ -53,7 +63,14 @@ ad-hoc signed, not notarized. The script sets the macOS 15 deployment target.
   replacement of older frames. Audio queues are bounded; overflow is an explicit
   capture error. Atomic subscriber snapshots and bounded concurrent queues keep
   routine source refresh, cleanup, and polling from dropping audio on mutex contention.
-  Writer subscriptions and recording overload handling come later.
+  Writer queues separately report late video drops and fatal audio overflow.
+  Per-recording status includes activity, queue depths, and saved paths or failures.
+- Rendering runs separately from capture/audio draining, with latest-only handoffs,
+  bounded pixel-buffer pools, and at most two in-flight submissions per native preview.
+  Active previews render at up to 30 FPS, inactive cards at up to 5 FPS, and hidden
+  previews suspend rendering when not recording. Active recordings render at their
+  configured cadence even offscreen and reuse static frames. Framing changes re-render; source
+  errors clear stale previews. Retina scaling affects presentation, not output dimensions.
 - Open **Oculi → Settings…** (`⌘,`) for global permissions and source discovery.
   Settings opens in its own window; appearance follows the macOS light/dark mode.
 - Video categories include cameras, displays, windows, and applications on each
@@ -71,7 +88,11 @@ ad-hoc signed, not notarized. The script sets the macOS 15 deployment target.
 - Settings live in `~/Library/Application Support/Oculi/settings.json`. Invalid or
   unsupported settings are preserved and editing is disabled until repaired.
 - Templates accept `{name}`, `{date}`, `{time}`, and `{counter}`; output is MP4.
-  Destination checks run off the UI thread. Save errors remain visible for retry.
+  One group timestamp is used for naming. Reservations and atomic no-replacement
+  promotion prevent overwriting existing files; counter suffixes resolve collisions.
+  Destination checks run off the UI thread. Failed media remains explicitly incomplete
+  in a hidden `.oculi-incomplete-*` destination subdirectory, not a promised recovered file.
+  Destinations must support same-filesystem hard links for final publication.
 
 ## Verification
 
@@ -87,7 +108,10 @@ The UI smoke run creates isolated settings/output directories beneath the suppli
 path and exits after exercising source-sheet save/cancel, output validation,
 delete confirmation/cancellation, drawer resizing, the Settings menu and
 asynchronous persistence. It also writes `workspace.png`, `workspace-light.png`
-and `workspace-dark.png` layout snapshots.
+and `workspace-dark.png` layout snapshots. Its synthetic GPU phase exercises the
+actual display link, event tracking, independent framing and fixed-canvas changes.
+With screen-recording permission, composited `workspace-live.png`, `framing.png`
+and `framing-clean.png` snapshots also verify displayed output separately from handles.
 It never uses the regular settings file. Native discovery smoke is opt-in via
 `OCULI_NATIVE_DISCOVERY_SMOKE=1 cargo test native_discovery_smoke -- --nocapture`;
 it reports skips if the required permissions are missing.
@@ -115,8 +139,8 @@ session. Camera reports include native input dimensions separately from the
 validated output dimensions. Cameras without input-priority support retain
 automatic native input negotiation; AVFoundation's output conversion scales to
 the requested dimensions with aspect fit, rather than requiring that sensor
-format. This does not increase the camera's native frame rate; recording cadence
-handling remains part of the planned writer work. A missing permission
+format. This does not increase the camera's native frame rate; the writer repeats
+the latest frame at the output cadence. A missing permission
 is still a skip, not successful verification; rebuilding an ad-hoc signed app may
 require macOS to grant access again.
 
@@ -125,4 +149,31 @@ never request permission automatically. Missing prerequisites are reported as
 skips, not hardware verification. Application/system audio needs active playback.
 Real audio routing and device disconnection behavior still require a permissioned
 macOS session; unit tests use fake adapters to exercise sharing, failures and queues.
-No encoding or saved-file verification is included at this stage.
+Permission-independent tests encode and decode simultaneous MP4s through the real
+renderer and writer, checking AAC tracks, dimensions, crop landmarks, timestamps,
+pause trimming, bounded queues, safe saves, and group lifecycle failure scenarios.
+
+GPU geometry/pixel tests run in the normal test suite without capture permissions.
+The shared-preview smoke additionally exercises live capture, two independently framed
+outputs, output resizing, and capture/render shutdown:
+
+```sh
+OCULI_NATIVE_CAPTURE_SMOKE=1 cargo test native_shared_preview_smoke -- --nocapture
+open -n -W target/debug/Oculi.app --args --preview-smoke-test "$PWD/target/smoke/previews-$(uuidgen).txt"
+```
+
+The preview check defaults to a display. For a camera, run the bundled executable
+with `OCULI_PREVIEW_SOURCE=camera`; it still requires that app's existing permission.
+Preview report exit codes are 0 for success, 1 for failure, and 2 for missing prerequisites.
+
+The explicit full-group recording smoke captures a display with system audio into
+two separate files, pauses/resumes, changes framing, saves, and tears down capture:
+
+```sh
+open -n -W target/debug/Oculi.app --args --recording-smoke-test "$PWD/target/smoke/recordings-$(uuidgen).txt"
+```
+
+It uses isolated output locations, does not change saved configurations or prompt
+for permissions, and reports paths and diagnostics. System audio needs active playback.
+This check creates media files intentionally; inspect the report for PASS, FAIL, or
+SKIP rather than treating missing hardware/permissions as successful verification.

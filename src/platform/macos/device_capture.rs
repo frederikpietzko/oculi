@@ -101,7 +101,7 @@ impl CallbackState {
         }
     }
 
-    fn receive(&self, buffer: &CMSampleBuffer) {
+    fn receive(&self, buffer: &CMSampleBuffer, session: &AVCaptureSession) {
         let mut status = self.status();
         if status.stopped || status.error.is_some() {
             return;
@@ -110,8 +110,16 @@ impl CallbackState {
         // No mutation or buffer pointer escapes; NativeSample retains ownership.
         let sample = unsafe {
             validate_sample(buffer, self.format).and_then(|kind| {
+                let clock = session.synchronizationClock().ok_or_else(|| {
+                    CaptureError::Native("Device synchronization clock is unavailable".into())
+                })?;
+                let host =
+                    crate::recording::clock::to_host(buffer.presentation_time_stamp(), &clock)
+                        .map_err(CaptureError::Native)?;
                 NativeSample::retain(buffer, kind)
-                    .ok_or_else(|| CaptureError::Native("Could not retain device sample".into()))
+                    .ok_or_else(|| CaptureError::Native("Could not retain device sample".into()))?
+                    .with_host_timestamp(host)
+                    .map_err(CaptureError::Native)
             })
         };
         match sample {
@@ -139,10 +147,17 @@ impl CallbackState {
     }
 }
 
+struct DeviceDelegateState {
+    callbacks: Arc<CallbackState>,
+    // Read only synchronizationClock during callbacks. Output delegates are
+    // detached and drained during stop before releasing the session graph.
+    session: Retained<AVCaptureSession>,
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "OculiDeviceCaptureDelegate"]
-    #[ivars = Arc<CallbackState>]
+    #[ivars = DeviceDelegateState]
     struct DeviceDelegate;
 
     unsafe impl NSObjectProtocol for DeviceDelegate {}
@@ -155,7 +170,10 @@ define_class!(
             buffer: &CMSampleBuffer,
             _connection: &AVCaptureConnection,
         ) {
-            self.ivars().callback(|| self.ivars().receive(buffer));
+            let state = self.ivars();
+            state
+                .callbacks
+                .callback(|| state.callbacks.receive(buffer, &state.session));
         }
 
         #[unsafe(method(captureOutput:didDropSampleBuffer:fromConnection:))]
@@ -165,7 +183,9 @@ define_class!(
             _buffer: &CMSampleBuffer,
             _connection: &AVCaptureConnection,
         ) {
-            self.ivars().callback(|| self.ivars().dropped());
+            self.ivars()
+                .callbacks
+                .callback(|| self.ivars().callbacks.dropped());
         }
     }
 
@@ -174,8 +194,8 @@ define_class!(
 );
 
 impl DeviceDelegate {
-    fn new(state: Arc<CallbackState>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(state);
+    fn new(callbacks: Arc<CallbackState>, session: Retained<AVCaptureSession>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(DeviceDelegateState { callbacks, session });
         // SAFETY: NSObject initialization, with Rust ivars already initialized.
         unsafe { msg_send![super(this), init] }
     }
@@ -657,7 +677,7 @@ fn start_native(
         }
         session.addInput(&input);
         let queue = DispatchQueue::new("oculi.device.samples", None);
-        let delegate = DeviceDelegate::new(state.clone());
+        let delegate = DeviceDelegate::new(state.clone(), session.clone());
         let output = match request.format {
             CaptureFormat::Video { width, height, fps } => {
                 if session.canSetSessionPreset(AVCaptureSessionPresetInputPriority) {

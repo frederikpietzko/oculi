@@ -5,6 +5,20 @@ fn main() {
         let mut args = std::env::args_os().skip(1);
         let smoke_directory = match args.next() {
             None => None,
+            Some(arg) if arg == "--recording-smoke-test" => {
+                let report = args
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .expect("--recording-smoke-test requires a new report file path");
+                std::process::exit(recording_smoke(report));
+            }
+            Some(arg) if arg == "--preview-smoke-test" => {
+                let report = args
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .expect("--preview-smoke-test requires a new report file path");
+                std::process::exit(preview_smoke(report));
+            }
             Some(arg) if arg == "--device-smoke-test" => {
                 let report = args
                     .next()
@@ -26,7 +40,7 @@ fn main() {
             }
             Some(_) => {
                 eprintln!(
-                    "Usage: oculi [--smoke-test OUTPUT_DIRECTORY | --device-smoke-test REPORT_FILE]"
+                    "Usage: oculi [--smoke-test OUTPUT_DIRECTORY | --device-smoke-test REPORT_FILE | --preview-smoke-test REPORT_FILE | --recording-smoke-test REPORT_FILE]"
                 );
                 std::process::exit(2);
             }
@@ -35,6 +49,51 @@ fn main() {
     }
     #[cfg(not(target_os = "macos"))]
     eprintln!("Oculi requires macOS 15 or later.");
+}
+
+#[cfg(target_os = "macos")]
+fn recording_smoke(path: std::path::PathBuf) -> i32 {
+    use std::io::Write;
+    let mut report = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create a new recording smoke report");
+    writeln!(report, "Bundle: {:?}\nNo permission prompts or saved configuration changes. Explicit smoke creates two media outputs.",
+        objc2_foundation::NSBundle::mainBundle().bundleIdentifier().map(|id| id.to_string())).expect("write identity");
+    report.flush().expect("flush identity");
+    let (code, message) = match oculi::recording::runtime::recording_smoke_check() {
+        Ok(message) => (if message.starts_with("SKIP") { 2 } else { 0 }, message),
+        Err(error) => (1, format!("FAIL {error}")),
+    };
+    writeln!(report, "{message}\nCOMPLETE exit_code={code}").expect("write result");
+    report.sync_all().expect("sync report");
+    code
+}
+
+#[cfg(target_os = "macos")]
+fn preview_smoke(path: std::path::PathBuf) -> i32 {
+    use std::io::Write;
+    let mut report = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create a new preview smoke report");
+    writeln!(
+        report,
+        "Bundle: {:?}\nNo permission prompts, settings changes, or media files.",
+        objc2_foundation::NSBundle::mainBundle()
+            .bundleIdentifier()
+            .map(|id| id.to_string())
+    )
+    .expect("write smoke identity");
+    let (code, message) = match oculi::platform::macos::capture::preview_smoke_check() {
+        Ok(message) => (if message.starts_with("SKIP") { 2 } else { 0 }, message),
+        Err(error) => (1, format!("FAIL {error}")),
+    };
+    writeln!(report, "{message}\nCOMPLETE exit_code={code}").expect("write preview result");
+    report.sync_all().expect("sync preview report");
+    code
 }
 
 #[cfg(target_os = "macos")]

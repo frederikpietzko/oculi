@@ -1,4 +1,4 @@
-//! Native workspace with capture diagnostics; live preview is a separate stage.
+//! Native workspace with clean live output cards and capture diagnostics.
 
 use std::cell::RefCell;
 
@@ -9,7 +9,10 @@ use objc2_app_kit::*;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use super::source_picker::{audio_title, video_title};
+use super::viewport::Preview;
 use super::{AppDelegate, label, ns, rect};
+use crate::model::{RecordingConfig, RecordingId};
+use crate::render::RenderedFrame;
 
 const SIDEBAR: f64 = 240.0;
 const FOOTER: f64 = 100.0;
@@ -37,6 +40,7 @@ pub(super) struct Workspace {
     pub edit: Retained<NSButton>,
     pub duplicate: Retained<NSButton>,
     pub remove: Retained<NSButton>,
+    pub framing: Retained<NSButton>,
     pub drawer_toggle: Retained<NSButton>,
     pub group_buttons: Vec<Retained<NSButton>>,
     root: Retained<NSView>,
@@ -72,13 +76,14 @@ struct SourceRow {
 }
 
 struct Card {
+    id: RecordingId,
     view: Retained<NSView>,
     background: Retained<NSBox>,
-    preview: Retained<NSBox>,
-    placeholder: Retained<NSTextField>,
+    preview: Preview,
     name: Retained<NSTextField>,
     video: Retained<NSTextField>,
     audio: Retained<NSTextField>,
+    report: Retained<NSTextField>,
     selection: Retained<NSTextField>,
     select: Retained<NSButton>,
 }
@@ -96,7 +101,7 @@ impl GridGeometry {
         let available = (width - 2.0 * GRID_INSET).max(1.0);
         let columns = ((available + GAP) / (340.0 + GAP)).floor().max(1.0) as usize;
         let card_width = (available - GAP * (columns - 1) as f64) / columns as f64;
-        let card_height = (card_width - 24.0).max(0.0) * 9.0 / 16.0 + 116.0;
+        let card_height = (card_width - 24.0).max(0.0) * 9.0 / 16.0 + 174.0;
         let rows = count.div_ceil(columns);
         let content_height =
             2.0 * GRID_INSET + rows as f64 * card_height + rows.saturating_sub(1) as f64 * GAP;
@@ -261,6 +266,12 @@ pub(super) fn build(delegate: &AppDelegate) -> Workspace {
         rect(0.0, 0.0, 1.0, 1.0),
         sel!(removeRecording:),
     );
+    let framing = delegate.button(
+        &root,
+        "Framing…",
+        rect(0.0, 0.0, 1.0, 1.0),
+        sel!(showFraming:),
+    );
     let (list_scroll, list) = scroll(&root, mtm);
     let heading = text(&root, "Recording workspace", 25.0, true, mtm);
     let count = secondary(&root, "No recording pairs configured", mtm);
@@ -281,7 +292,7 @@ pub(super) fn build(delegate: &AppDelegate) -> Workspace {
     );
     let empty_hint = secondary(
         &grid,
-        "Use Add Source… to configure a video and audio pair. Preview is not connected.",
+        "Use Add Source… to configure a video and audio pair with a live output preview.",
         mtm,
     );
     empty_title.setAlignment(NSTextAlignment::Center);
@@ -342,24 +353,22 @@ pub(super) fn build(delegate: &AppDelegate) -> Workspace {
     let group_title = text(&root, "Group recording", 13.0, true, mtm);
     let group_reason = secondary(
         &root,
-        "Unavailable — recording pipeline not connected.",
+        "Add available video and audio sources to start recording.",
         mtm,
     );
     let message = secondary(&root, "", mtm);
-    let group_buttons = ["Start", "Pause", "Stop & Save"]
-        .into_iter()
-        .map(|title| {
-            let button =
-                unsafe { NSButton::buttonWithTitle_target_action(&ns(title), None, None, mtm) };
-            button.setBezelStyle(NSBezelStyle::Push);
-            button.setEnabled(false);
-            button.setToolTip(Some(&ns(
-                "Recording is unavailable: the capture and recording pipeline is not connected.",
-            )));
-            root.addSubview(&button);
-            button
-        })
-        .collect();
+    let group_buttons = [
+        ("Start", sel!(startGroup:)),
+        ("Pause", sel!(pauseGroup:)),
+        ("Stop & Save", sel!(stopGroup:)),
+    ]
+    .into_iter()
+    .map(|(title, action)| {
+        let button = delegate.button(&root, title, rect(0.0, 0.0, 1.0, 1.0), action);
+        button.setEnabled(false);
+        button
+    })
+    .collect();
 
     let workspace = Workspace {
         window,
@@ -379,11 +388,13 @@ pub(super) fn build(delegate: &AppDelegate) -> Workspace {
             remove.clone(),
             choose.clone(),
             apply.clone(),
+            framing.clone(),
         ],
         add,
         edit,
         duplicate,
         remove,
+        framing,
         drawer_toggle,
         group_buttons,
         root,
@@ -418,11 +429,14 @@ pub(super) fn refresh(delegate: &AppDelegate) {
     let workspace = &delegate.controls().workspace;
     let mtm = delegate.mtm();
     let state = delegate.ivars().state.borrow();
-    let enabled = state.can_save && state.selected().is_some();
-    workspace.add.setEnabled(state.can_save);
+    let enabled = state.configuration_editable() && state.selected().is_some();
+    workspace.add.setEnabled(state.configuration_editable());
     for button in &workspace.edit_buttons {
         button.setEnabled(enabled);
     }
+    workspace
+        .framing
+        .setEnabled(state.can_save && state.selected().is_some());
     for field in [
         &workspace.directory,
         &workspace.template,
@@ -440,7 +454,7 @@ pub(super) fn refresh(delegate: &AppDelegate) {
     }
     let count = state.settings.recordings.len();
     workspace.count.setStringValue(&ns(&format!(
-        "{count} recording {}  ·  No files are being recorded",
+        "{count} recording {}",
         if count == 1 { "pair" } else { "pairs" }
     )));
     workspace.empty_title.setHidden(count != 0);
@@ -496,11 +510,8 @@ pub(super) fn refresh(delegate: &AppDelegate) {
             NSColor::separatorColor()
         };
         background.setBorderColor(&border_color);
-        let preview = panel(&card_view, &NSColor::blackColor(), mtm);
-        preview.setCornerRadius(6.0);
-        let placeholder = text(&card_view, "Preview not connected", 14.0, false, mtm);
-        placeholder.setTextColor(Some(&NSColor::whiteColor()));
-        placeholder.setAlignment(NSTextAlignment::Center);
+        let preview = Preview::new(mtm, false);
+        card_view.addSubview(&preview.view);
         let name = text(&card_view, &recording.name, 15.0, true, mtm);
         let video = secondary(
             &card_view,
@@ -512,6 +523,10 @@ pub(super) fn refresh(delegate: &AppDelegate) {
             &format!("Audio · {}", audio_title(&recording.audio)),
             mtm,
         );
+        let report = secondary(&card_view, &state.recording_summary(recording.id), mtm);
+        report.setMaximumNumberOfLines(3);
+        report.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+        report.setSelectable(true);
         let selection = text(
             &card_view,
             if selected { "Selected" } else { "" },
@@ -524,7 +539,7 @@ pub(super) fn refresh(delegate: &AppDelegate) {
         let select = selection_button(
             &card_view,
             &format!(
-                "Select {}. Video: {}. Audio: {}. Preview not connected.{}",
+                "Select {}. Video: {}. Audio: {}. Use Framing to edit the live output.{}",
                 recording.name,
                 video_title(&recording.video),
                 audio_title(&recording.audio),
@@ -534,13 +549,14 @@ pub(super) fn refresh(delegate: &AppDelegate) {
             delegate,
         );
         workspace.cards.borrow_mut().push(Card {
+            id: recording.id,
             view: card_view,
             background,
             preview,
-            placeholder,
             name,
             video,
             audio,
+            report,
             selection,
             select,
         });
@@ -566,22 +582,89 @@ pub(super) fn refresh_capture(delegate: &AppDelegate) {
         .iter()
         .zip(workspace.rows.borrow().iter())
     {
-        let summary = ns(&state.capture_summary(recording.id));
+        let summary = ns(&state.recording_summary(recording.id));
         row.detail.setStringValue(&summary);
         row.detail.setToolTip(Some(&summary));
     }
-    for (recording, card) in state
-        .settings
-        .recordings
-        .iter()
-        .zip(workspace.cards.borrow().iter())
-    {
-        card.placeholder
-            .setToolTip(Some(&ns(&state.capture_summary(recording.id))));
+}
+
+pub(super) fn refresh_group(delegate: &AppDelegate) {
+    let workspace = &delegate.controls().workspace;
+    let state = delegate.ivars().state.borrow();
+    workspace.group_title.setStringValue(&ns("Group recording"));
+    let summary = state.group_summary();
+    let reason = state.group.error.as_ref().cloned().unwrap_or_else(|| {
+        if state.configuration_locked() {
+            summary.clone()
+        } else {
+            state
+                .start_block_reason()
+                .unwrap_or_else(|| summary.clone())
+        }
+    });
+    workspace.group_reason.setStringValue(&ns(&reason));
+    workspace.group_reason.setToolTip(Some(&ns(&reason)));
+    workspace.count.setStringValue(&ns(&format!(
+        "{} recording pairs · {summary}",
+        state.settings.recordings.len()
+    )));
+    for card in workspace.cards.borrow().iter() {
+        let report = ns(&state.recording_summary(card.id));
+        card.report.setStringValue(&report);
+        card.report.setToolTip(Some(&report));
     }
+    drop(state);
+    refresh_capture(delegate);
 }
 
 impl Workspace {
+    pub fn smoke_check_orientation(&self, id: RecordingId, screenshot: &std::path::Path) {
+        let cards = self.cards.borrow();
+        let card = cards
+            .iter()
+            .find(|card| card.id == id)
+            .expect("synthetic preview card");
+        card.preview.smoke_check_orientation(screenshot);
+    }
+
+    pub fn smoke_check_presented(&self, id: RecordingId) {
+        let cards = self.cards.borrow();
+        let card = cards
+            .iter()
+            .find(|card| card.id == id)
+            .expect("synthetic preview card");
+        card.preview.smoke_check_presented();
+    }
+
+    pub fn smoke_check_layers(&self) {
+        for card in self.cards.borrow().iter() {
+            card.preview.smoke_check_layer();
+        }
+    }
+
+    pub fn preview_visible(&self, id: RecordingId) -> bool {
+        self.cards
+            .borrow()
+            .iter()
+            .any(|card| card.id == id && card.preview.visible())
+    }
+
+    pub fn update_preview(
+        &self,
+        recording: &RecordingConfig,
+        frame: Option<Result<RenderedFrame, String>>,
+        status: &str,
+    ) {
+        if let Some(card) = self
+            .cards
+            .borrow()
+            .iter()
+            .find(|card| card.id == recording.id)
+            && card.preview.visible()
+        {
+            card.preview.update(recording, frame, status, false);
+        }
+    }
     fn set_frames(&self, drawer_open: bool) {
         let size = self.root.bounds().size;
         let width = size.width;
@@ -606,6 +689,8 @@ impl Workspace {
         self.duplicate
             .setFrame(rect(120.0, FOOTER + 96.0, 108.0, 30.0));
         self.remove.setFrame(rect(12.0, FOOTER + 60.0, 106.0, 30.0));
+        self.framing
+            .setFrame(rect(120.0, FOOTER + 60.0, 108.0, 30.0));
         self.list_scroll.setFrame(rect(
             8.0,
             FOOTER + 140.0,
@@ -747,24 +832,20 @@ impl Workspace {
             let preview_height = (width - 24.0) * 9.0 / 16.0;
             card.view.setFrame(frame);
             card.background.setFrame(card.view.bounds());
-            card.preview.setFrame(rect(
+            card.preview.view.setFrame(rect(
                 12.0,
                 height - 12.0 - preview_height,
                 width - 24.0,
                 preview_height,
             ));
-            card.placeholder.setFrame(rect(
-                24.0,
-                height - 12.0 - preview_height / 2.0 - 10.0,
-                width - 48.0,
-                22.0,
-            ));
-            card.name.setFrame(rect(16.0, 72.0, width - 104.0, 22.0));
+            card.preview.layout();
+            card.name.setFrame(rect(16.0, 130.0, width - 104.0, 22.0));
             card.selection
-                .setFrame(rect(width - 84.0, 74.0, 68.0, 18.0));
-            card.video.setFrame(rect(16.0, 44.0, width - 32.0, 20.0));
-            card.audio.setFrame(rect(16.0, 20.0, width - 32.0, 20.0));
-            card.select.setFrame(card.view.bounds());
+                .setFrame(rect(width - 84.0, 132.0, 68.0, 18.0));
+            card.video.setFrame(rect(16.0, 102.0, width - 32.0, 20.0));
+            card.audio.setFrame(rect(16.0, 78.0, width - 32.0, 20.0));
+            card.report.setFrame(rect(16.0, 8.0, width - 32.0, 64.0));
+            card.select.setFrame(rect(0.0, 74.0, width, height - 74.0));
         }
         self.empty_title.setFrame(rect(
             24.0,
@@ -832,7 +913,7 @@ mod tests {
         let geometry = GridGeometry::new(792.0, 350.0, 0);
         assert_eq!(geometry.document_height, 350.0);
         let preview_width = geometry.card_width - 24.0;
-        let preview_height = geometry.card_height - 116.0;
+        let preview_height = geometry.card_height - 174.0;
         assert!((preview_width / preview_height - 16.0 / 9.0).abs() < 0.0001);
         let populated = GridGeometry::new(792.0, 350.0, 20);
         assert!(populated.document_height > 350.0);

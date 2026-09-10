@@ -149,7 +149,7 @@ Multiple recording configurations can consume shared native capture sources with
 - Propagate permission changes, source loss, device contention, and stream errors to application state.
 - Test shared-source reuse, teardown, slow subscribers, and permission-gated adapter capture.
 
-### * Step 4: Add live previews and single-source viewport editing
+### ✓ Step 4: Add live previews and single-source viewport editing
 Each recording previews its own editable crop and framing before and during capture.
 - Implement GPU-backed rendering and native previews in `render` and `ui/viewport.rs`.
 - Add drag/resize/crop/zoom, numeric placement, fit/fill/reset, and fixed-canvas output settings.
@@ -157,7 +157,7 @@ Each recording previews its own editable crop and framing before and during capt
 - Throttle inactive previews and handle Retina coordinates and changing source dimensions.
 - Test transform geometry, preview/output frame consistency, and independent framing of a shared source.
 
-###   Step 5: Implement independent media files on a shared timeline
+### ✓ Step 5: Implement independent media files on a shared timeline
 Each recording can write a correctly timed audio/video MP4 to its configured destination.
 - Implement `recording/writer.rs` and `timeline.rs` using AVAssetWriter, pooled rendered buffers, AAC audio, and shared host-clock mapping.
 - Support common start boundaries, pause-offset retiming, audio boundary trimming, static-frame cadence, and drift diagnostics.
@@ -165,7 +165,7 @@ Each recording can write a correctly timed audio/video MP4 to its configured des
 - Enforce bounded writer queues and explicit overload/disk-write failure reporting.
 - Validate concurrent synthetic recordings, decoded crop landmarks, audio/video timing, repeated pauses, and save failures.
 
-###   Step 6: Connect group recording controls and robust lifecycle handling
+### ✓ Step 6: Connect group recording controls and robust lifecycle handling
 Start, Pause, Resume, and Stop & Save reliably control every configured recording while previews remain responsive.
 - Implement the serialized group coordinator with all-recording preflight, preparation rollback, common lifecycle boundaries, and asynchronous finalization.
 - Wire group controls, elapsed time, audio activity, output paths, progress, and error states into the native interface.

@@ -7,7 +7,11 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use crate::capture::service::{CaptureSnapshot, CaptureState, CaptureTarget};
 use crate::capture::{CaptureFormat, CaptureRequest, SourceKey};
 use crate::discovery::SourceCatalog;
-use crate::model::{RecordingConfig, RecordingId, SourceAvailability, VideoSourceSelector};
+use crate::model::{
+    GroupState, OutputSettings, RecordingConfig, RecordingId, SourceAvailability,
+    VideoSourceSelector,
+};
+use crate::recording::coordinator::GroupSnapshot;
 use crate::storage::{PersistedSettings, ensure_writable_directory, load_settings, save_settings};
 
 pub struct AppState {
@@ -18,6 +22,9 @@ pub struct AppState {
     pub can_save: bool,
     pub dirty: bool,
     pub capture: CaptureSnapshot,
+    pub group: GroupSnapshot,
+    start_pending: bool,
+    start_sequence: Option<u64>,
     restored_windows: HashSet<RecordingId>,
 }
 
@@ -56,6 +63,9 @@ impl AppState {
             can_save: true,
             dirty: false,
             capture: CaptureSnapshot::default(),
+            group: GroupSnapshot::default(),
+            start_pending: false,
+            start_sequence: None,
             restored_windows,
         }
     }
@@ -68,6 +78,9 @@ impl AppState {
     }
 
     pub fn add(&mut self) {
+        if !self.configuration_editable() {
+            return;
+        }
         let recording =
             RecordingConfig::new(format!("Recording {}", self.settings.recordings.len() + 1));
         self.selected = Some(recording.id);
@@ -76,6 +89,9 @@ impl AppState {
     }
 
     pub fn duplicate(&mut self) {
+        if !self.configuration_editable() {
+            return;
+        }
         if let Some(original) = self.selected() {
             let copy = original.duplicate();
             if self.restored_windows.contains(&original.id) {
@@ -94,9 +110,7 @@ impl AppState {
         is_new: bool,
         video_reselected: bool,
     ) -> Result<(), String> {
-        if !self.can_save {
-            return Err("Configuration editing is unavailable until settings are repaired.".into());
-        }
+        self.require_configuration_editable()?;
         draft.name = draft.name.trim().into();
         if draft.name.is_empty() {
             return Err("Give this source a name.".into());
@@ -121,7 +135,7 @@ impl AppState {
     }
 
     pub fn remove_confirmed(&mut self, id: RecordingId) {
-        if !self.can_save {
+        if !self.configuration_editable() {
             return;
         }
         if let Some(index) = self.settings.recordings.iter().position(|r| r.id == id) {
@@ -139,6 +153,9 @@ impl AppState {
     }
 
     pub fn remove(&mut self) {
+        if !self.configuration_editable() {
+            return;
+        }
         if let Some(id) = self.selected {
             let index = self
                 .settings
@@ -158,6 +175,9 @@ impl AppState {
     }
 
     pub fn replace_selected(&mut self, mut recording: RecordingConfig, video_reselected: bool) {
+        if !self.configuration_editable() {
+            return;
+        }
         if video_reselected {
             self.restored_windows.remove(&recording.id);
         }
@@ -175,6 +195,146 @@ impl AppState {
             *existing = recording;
             self.dirty = true;
         }
+    }
+
+    pub fn configuration_locked(&self) -> bool {
+        self.start_pending || self.group.active()
+    }
+
+    pub fn configuration_editable(&self) -> bool {
+        self.can_save && !self.configuration_locked()
+    }
+
+    fn require_configuration_editable(&self) -> Result<(), String> {
+        if self.configuration_locked() {
+            Err("Source and output settings are locked until Stop & Save finishes. Framing remains editable.".into())
+        } else if !self.can_save {
+            Err("Configuration editing is unavailable until settings are repaired.".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn apply_output(&mut self, id: RecordingId, output: OutputSettings) -> Result<(), String> {
+        self.require_configuration_editable()?;
+        output.validate_format()?;
+        if !output.directory.is_absolute() {
+            return Err("Choose an output directory or enter its full absolute path.".into());
+        }
+        let recording = self
+            .settings
+            .recordings
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or("This recording no longer exists.")?;
+        if recording.output != output {
+            recording.output = output;
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    pub fn start_block_reason(&self) -> Option<String> {
+        if let Err(error) = self.require_configuration_editable() {
+            return Some(error);
+        }
+        if self.settings.recordings.is_empty() {
+            return Some("Add a video and audio source before starting.".into());
+        }
+        for recording in &self.settings.recordings {
+            if SourceKey::video(&recording.video).is_none()
+                || SourceKey::audio(&recording.audio).is_none()
+                || recording.video_availability != SourceAvailability::Available
+                || recording.audio_availability != SourceAvailability::Available
+            {
+                return Some(format!(
+                    "{}: choose available video and audio sources; check permissions in Settings.",
+                    recording.name
+                ));
+            }
+        }
+        None
+    }
+
+    pub fn begin_group_start(&mut self) -> Result<Vec<RecordingConfig>, String> {
+        if let Some(error) = self.start_block_reason() {
+            return Err(error);
+        }
+        self.start_pending = true;
+        self.start_sequence = None;
+        Ok(self.settings.recordings.clone())
+    }
+
+    pub fn accept_group_start(&mut self, sequence: u64) {
+        if self.start_pending {
+            self.start_sequence = Some(sequence);
+        }
+    }
+
+    pub fn reject_group_start(&mut self, error: String) {
+        self.start_pending = false;
+        self.start_sequence = None;
+        self.message = error;
+    }
+
+    pub fn update_group(&mut self, snapshot: GroupSnapshot) {
+        // State alone cannot acknowledge Start: it may belong to a previous run.
+        if self
+            .start_sequence
+            .is_some_and(|sequence| snapshot.command_sequence >= sequence)
+        {
+            self.start_pending = false;
+            self.start_sequence = None;
+        }
+        self.group = snapshot;
+    }
+
+    pub fn effective_group_state(&self) -> GroupState {
+        if self.start_pending {
+            GroupState::Preparing
+        } else {
+            self.group.state
+        }
+    }
+
+    pub fn group_summary(&self) -> String {
+        let seconds = self.group.elapsed.max(0.0) as u64;
+        let elapsed = format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+        let status = match self.effective_group_state() {
+            GroupState::Idle => "Idle",
+            GroupState::Preparing => "Preparing — checking sources and destinations",
+            GroupState::Recording => "Recording",
+            GroupState::Paused => "Paused",
+            GroupState::Finalizing => "Finalizing — saving files; please wait",
+            GroupState::Failed => "Failed — review output errors",
+        };
+        format!("{status} · {elapsed}")
+    }
+
+    pub fn recording_summary(&self, id: RecordingId) -> String {
+        let Some(report) = self.group.recordings.iter().find(|report| report.id == id) else {
+            return self.capture_summary(id);
+        };
+        let mut summary = format!(
+            "{} · Audio {:.0}% · Dropped {} · Queues V:{} A:{}",
+            report.status,
+            report.audio_level.clamp(0.0, 1.0) * 100.0,
+            report.dropped_video,
+            report.video_queue,
+            report.audio_queue
+        );
+        if let Some(path) = &report.saved_path {
+            summary.push_str(&format!("\nSaved: {}", path.display()));
+        }
+        if let Some(error) = &report.error {
+            summary.push_str(&format!("\nError: {error}"));
+        }
+        summary
     }
 
     pub fn update_catalog(&mut self, catalog: SourceCatalog) {
@@ -278,7 +438,7 @@ impl AppState {
             if dropped > 0 {
                 format!("Capture active · {dropped} skipped samples (preview only)")
             } else {
-                "Video + audio capture active · preview coming next".into()
+                "Video + audio capture active · live preview".into()
             }
         } else {
             format!("Waiting for source samples ({receiving}/2) · not recording")
@@ -390,6 +550,211 @@ impl SettingsWorker {
 mod tests {
     use super::*;
     use crate::model::WindowId;
+
+    fn ready_state() -> AppState {
+        let mut state = AppState::from_settings(PersistedSettings::default());
+        state.add();
+        let recording = &mut state.settings.recordings[0];
+        recording.video = VideoSourceSelector::Display {
+            display_id: crate::model::DisplayId(1),
+            label: "Display".into(),
+        };
+        recording.audio = crate::model::AudioSourceSelector::System;
+        recording.video_availability = SourceAvailability::Available;
+        recording.audio_availability = SourceAvailability::Available;
+        state.dirty = false;
+        state
+    }
+
+    fn assert_configuration_locked(state: &mut AppState) {
+        let original = state.settings.recordings.clone();
+        let selection = state.selected;
+        let mut draft = original[0].clone();
+        draft.name = "Must not replace".into();
+        state.add();
+        state.duplicate();
+        state.remove();
+        state.remove_confirmed(draft.id);
+        state.replace_selected(draft.clone(), true);
+        assert!(
+            state
+                .apply_source_draft(draft.clone(), false, true)
+                .is_err()
+        );
+        assert!(
+            state
+                .apply_source_draft(draft.duplicate(), true, true)
+                .is_err()
+        );
+        draft.output.fps = 60;
+        assert!(state.apply_output(draft.id, draft.output).is_err());
+        assert!(state.begin_group_start().is_err());
+        assert_eq!(state.settings.recordings, original);
+        assert_eq!(state.selected, selection);
+        assert!(!state.dirty);
+    }
+
+    #[test]
+    fn all_configuration_mutations_lock_for_every_active_group_state() {
+        for group in [
+            GroupState::Preparing,
+            GroupState::Recording,
+            GroupState::Paused,
+            GroupState::Finalizing,
+        ] {
+            let mut state = ready_state();
+            state.update_group(GroupSnapshot {
+                state: group,
+                ..Default::default()
+            });
+            assert_configuration_locked(&mut state);
+            state.update_group(GroupSnapshot::default());
+            state.duplicate();
+            assert_eq!(state.settings.recordings.len(), 2);
+        }
+    }
+
+    #[test]
+    fn queued_start_locks_before_backend_ack_and_idle_does_not_unlock() {
+        let mut state = ready_state();
+        let configs = state.begin_group_start().unwrap();
+        assert_eq!(configs, state.settings.recordings);
+        assert_eq!(state.effective_group_state(), GroupState::Preparing);
+        state.update_group(GroupSnapshot::default());
+        assert_configuration_locked(&mut state);
+        state.accept_group_start(1);
+        state.update_group(GroupSnapshot {
+            state: GroupState::Preparing,
+            command_sequence: 1,
+            ..Default::default()
+        });
+        assert_configuration_locked(&mut state);
+        state.update_group(GroupSnapshot {
+            state: GroupState::Failed,
+            error: Some("Permission denied".into()),
+            command_sequence: 1,
+            ..Default::default()
+        });
+        assert!(state.configuration_editable());
+        assert!(state.begin_group_start().is_ok());
+        state.reject_group_start("Command queue full; retry Start.".into());
+        assert!(state.configuration_editable());
+        assert!(state.message.contains("retry Start"));
+    }
+
+    #[test]
+    fn retried_start_waits_for_its_sequence_not_stale_state_or_unrelated_ack() {
+        for acknowledged_state in [GroupState::Failed, GroupState::Recording, GroupState::Idle] {
+            for acknowledged_sequence in [12, 13] {
+                let mut state = ready_state();
+                let failed = GroupSnapshot {
+                    state: GroupState::Failed,
+                    command_sequence: 10,
+                    ..Default::default()
+                };
+                state.update_group(failed.clone());
+                state.begin_group_start().unwrap();
+                // Even polling before enqueue returns must preserve the local lock.
+                state.update_group(failed.clone());
+                assert_configuration_locked(&mut state);
+                state.accept_group_start(12);
+                for stale in [
+                    failed,
+                    GroupSnapshot {
+                        state: GroupState::Idle,
+                        command_sequence: 11,
+                        ..Default::default()
+                    },
+                ] {
+                    state.update_group(stale);
+                    assert_eq!(state.effective_group_state(), GroupState::Preparing);
+                    assert_configuration_locked(&mut state);
+                }
+                state.update_group(GroupSnapshot {
+                    state: acknowledged_state,
+                    command_sequence: acknowledged_sequence,
+                    ..Default::default()
+                });
+                assert!(!state.start_pending);
+                assert_eq!(state.start_sequence, None);
+                assert_eq!(state.effective_group_state(), acknowledged_state);
+                assert_eq!(
+                    state.configuration_locked(),
+                    acknowledged_state == GroupState::Recording
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn start_requires_settings_and_real_available_source_selections() {
+        let mut state = AppState::from_settings(PersistedSettings::default());
+        assert!(state.begin_group_start().is_err());
+        state.add();
+        assert!(state.begin_group_start().is_err());
+        let mut state = ready_state();
+        state.settings.recordings[0].audio_availability = SourceAvailability::Unknown;
+        assert!(state.begin_group_start().is_err());
+        state.settings.recordings[0].audio_availability = SourceAvailability::Available;
+        state.can_save = false;
+        assert_configuration_locked(&mut state);
+        state.can_save = true;
+        assert!(state.begin_group_start().is_ok());
+    }
+
+    #[test]
+    fn output_edits_are_transactional_and_do_not_replace_sources_or_framing() {
+        let mut state = ready_state();
+        let original = state.selected().unwrap().clone();
+        let mut output = original.output.clone();
+        output.resolution.width = 1921;
+        assert!(state.apply_output(original.id, output.clone()).is_err());
+        assert_eq!(state.selected(), Some(&original));
+        output.resolution.width = 1920;
+        output.directory = PathBuf::from("/tmp/oculi-output-test");
+        output.fps = 60;
+        state.apply_output(original.id, output.clone()).unwrap();
+        let current = state.selected().unwrap();
+        assert_eq!(current.output, output);
+        assert_eq!(current.video, original.video);
+        assert_eq!(current.audio, original.audio);
+        assert_eq!(current.viewport, original.viewport);
+    }
+
+    #[test]
+    fn group_reports_keep_saved_paths_failures_and_diagnostics_after_finalization() {
+        let mut state = ready_state();
+        let recording = state.selected().unwrap();
+        let report = crate::recording::coordinator::RecordingReport {
+            id: recording.id,
+            name: recording.name.clone(),
+            status: "Saved with warning".into(),
+            saved_path: Some(PathBuf::from("/tmp/output.mp4")),
+            error: Some("Audio ended early".into()),
+            audio_level: 0.5,
+            dropped_video: 12,
+            video_queue: 2,
+            audio_queue: 3,
+        };
+        let id = report.id;
+        state.update_group(GroupSnapshot {
+            elapsed: 3661.0,
+            recordings: vec![report],
+            ..Default::default()
+        });
+        let summary = state.recording_summary(id);
+        for text in [
+            "Saved: /tmp/output.mp4",
+            "Audio ended early",
+            "Audio 50%",
+            "Dropped 12",
+            "V:2 A:3",
+        ] {
+            assert!(summary.contains(text), "{summary}");
+        }
+        assert!(state.group_summary().contains("01:01:01"));
+        assert!(!state.configuration_locked());
+    }
 
     #[test]
     fn capture_demand_excludes_unavailable_sources_without_substitution() {

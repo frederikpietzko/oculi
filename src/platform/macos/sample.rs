@@ -1,9 +1,11 @@
-//! The only cross-thread native media value. No native buffer escapes this API.
+//! Immutable captured media. Native reads require an explicit unsafe contract.
 
+use crate::model::Resolution;
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{
     CMSampleBuffer, CMTime, CMTimeFlags, kCMMediaType_Audio, kCMMediaType_Video,
 };
+use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 use std::ptr::NonNull;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +21,7 @@ pub struct NativeSample {
     _buffer: CFRetained<CMSampleBuffer>,
     kind: SampleKind,
     timestamp: f64,
+    dimensions: Option<Resolution>,
 }
 
 // SAFETY: This is deliberately NOT an implementation for CMSampleBuffer or a
@@ -29,7 +32,8 @@ pub struct NativeSample {
 // use copied Rust metadata, and there is no safe access to the native object.
 // Holding the sample prevents AVFoundation/ScreenCaptureKit from recycling its
 // backing storage until the final release. Future accessors must preserve this
-// invariant; a raw/shared native accessor would invalidate this audit.
+// invariant; the crate-only unsafe read accessor transfers these obligations to
+// its caller, never granting safe native mutation or untracked buffer escape.
 unsafe impl Send for NativeSample {}
 // SAFETY: Sharing only exposes immutable copied metadata and thread-safe CF
 // reference counting, under the same constructor obligations as Send above.
@@ -61,10 +65,17 @@ impl NativeSample {
                 return None;
             }
             let timestamp = numeric_seconds(buffer.presentation_time_stamp())?;
+            let dimensions = buffer.image_buffer().and_then(|image| {
+                Some(Resolution {
+                    width: u32::try_from(CVPixelBufferGetWidth(&image)).ok()?,
+                    height: u32::try_from(CVPixelBufferGetHeight(&image)).ok()?,
+                })
+            });
             Some(Self {
                 _buffer: CFRetained::retain(NonNull::from(buffer)),
                 kind,
                 timestamp,
+                dimensions,
             })
         }
     }
@@ -75,6 +86,42 @@ impl NativeSample {
 
     pub fn timestamp_seconds(&self) -> f64 {
         self.timestamp
+    }
+
+    /// Stores host-clock seconds for production capture metadata. The immutable
+    /// native PTS is unchanged; the writer separately copies and retimes PCM.
+    pub(crate) fn with_host_timestamp(mut self, seconds: f64) -> Result<Self, String> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err("Host timestamp must be finite and nonnegative".into());
+        }
+        self.timestamp = seconds;
+        Ok(self)
+    }
+
+    pub fn dimensions(&self) -> Option<Resolution> {
+        self.dimensions
+    }
+
+    /// Native image access exclusively for immutable rendering.
+    ///
+    /// # Safety
+    /// Do not mutate the buffer, attachments, planes, or any backing storage.
+    /// Do not expose it through safe APIs or let native aliases escape the
+    /// read operation. Retain this sample until all asynchronous GPU reads
+    /// complete; CIImage/texture aliases must be released before that owner.
+    pub(crate) unsafe fn image_buffer_read(&self) -> Option<CFRetained<CVPixelBuffer>> {
+        unsafe { self._buffer.image_buffer() }
+    }
+
+    /// Native access exclusively for synchronous PCM copying by the writer.
+    ///
+    /// # Safety
+    /// Never mutate or invalidate the sample, attachments, format, or storage.
+    /// Keep this owner alive throughout the read. Neither the reference nor
+    /// retained native aliases may escape the read operation; asynchronous
+    /// consumers must receive independently owned copies, including the format.
+    pub(crate) unsafe fn buffer_read(&self) -> &CMSampleBuffer {
+        &self._buffer
     }
 }
 

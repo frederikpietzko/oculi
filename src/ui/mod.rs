@@ -1,7 +1,9 @@
 //! Main-thread-only AppKit configuration interface.
 
 mod dialogs;
+mod group;
 mod source_picker;
+mod viewport;
 mod workspace;
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -28,6 +30,7 @@ struct Controls {
     workspace: workspace::Workspace,
     source: dialogs::SourceDialog,
     global: dialogs::GlobalDialog,
+    framing: viewport::Framing,
     window: Retained<NSWindow>,
     name: Retained<NSTextField>,
     video: Retained<NSPopUpButton>,
@@ -52,9 +55,14 @@ struct DelegateIvars {
     audios: RefCell<Vec<AudioSourceSelector>>,
     discovery: RefCell<Option<Receiver<SourceCatalog>>>,
     last_refresh: Cell<Instant>,
+    last_slow_tick: Cell<Instant>,
+    viewport_edited: Cell<Option<Instant>>,
     device_refresh_due: Cell<bool>,
     timer: RefCell<Option<Retained<NSTimer>>>,
     quitting: Cell<bool>,
+    quit_after_group: Cell<bool>,
+    quit_stop_sent: Cell<bool>,
+    group_menu: OnceCell<Vec<Retained<NSMenuItem>>>,
     smoke_directory: Option<std::path::PathBuf>,
     smoke_started: Cell<bool>,
     drawer_open: Cell<bool>,
@@ -63,6 +71,9 @@ struct DelegateIvars {
     video_reselected: Cell<bool>,
     delete_alert: RefCell<Option<Retained<NSAlert>>>,
     smoke_phase: Cell<u32>,
+    smoke_preview: RefCell<Option<(crate::model::RecordingId, crate::render::RenderedFrame)>>,
+    smoke_preview_ticks: Cell<u32>,
+    smoke_tracking_ticks: Cell<u32>,
 }
 
 define_class!(
@@ -84,11 +95,12 @@ define_class!(
             }
             // NSTimer invokes this selector on the main run loop, where self lives.
             let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                0.2, self, sel!(tick:), None, true,
+                1.0 / 30.0, self, sel!(tick:), None, true,
             ) };
             // TerminateLater enters a modal run loop; persistence/capture polling
             // must continue there until the asynchronous quit reply is ready.
             unsafe { objc2_foundation::NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode); }
+            unsafe { objc2_foundation::NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSEventTrackingRunLoopMode); }
             *self.ivars().timer.borrow_mut() = Some(timer);
         }
 
@@ -97,11 +109,27 @@ define_class!(
 
         #[unsafe(method(applicationShouldTerminate:))]
         fn should_terminate(&self, _app: &NSApplication) -> NSApplicationTerminateReply {
+            if self.ivars().quit_after_group.get() { return NSApplicationTerminateReply::TerminateLater; }
             if self.ivars().source_draft.borrow().is_some() {
                 self.controls().source.window.makeKeyAndOrderFront(None);
                 return NSApplicationTerminateReply::TerminateCancel;
             }
+            self.flush_viewport_edit();
             if !self.commit_editor(false) { return NSApplicationTerminateReply::TerminateCancel; }
+            self.poll_group();
+            if self.ivars().state.borrow().configuration_locked() {
+                let alert = NSAlert::new(self.mtm());
+                alert.setMessageText(&ns("Stop & Save before quitting?"));
+                alert.setInformativeText(&ns("Oculi will stay open and responsive until every recording finishes saving. Encoder finalization will not be interrupted."));
+                alert.addButtonWithTitle(&ns("Cancel"));
+                alert.addButtonWithTitle(&ns("Stop & Save, then Quit"));
+                if alert.runModal() != NSAlertSecondButtonReturn { return NSApplicationTerminateReply::TerminateCancel; }
+                self.ivars().quitting.set(true);
+                self.ivars().quit_after_group.set(true);
+                self.ivars().quit_stop_sent.set(false);
+                self.save();
+                return NSApplicationTerminateReply::TerminateLater;
+            }
             self.save();
             self.ivars().capture.borrow().shutdown();
             if self.ivars().saver.borrow().pending || self.ivars().state.borrow().dirty || !self.ivars().capture.borrow().is_finished() {
@@ -120,6 +148,7 @@ define_class!(
     unsafe impl NSWindowDelegate for AppDelegate {
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, window: &NSWindow) -> bool {
+            if window == &*self.controls().framing.window { self.flush_viewport_edit(); }
             if window == &*self.controls().source.window {
                 self.dismiss_source();
                 return false.into();
@@ -131,13 +160,19 @@ define_class!(
 
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, _notification: &NSNotification) {
-            if self.ivars().controls.get().is_some() { workspace::layout(self); }
+            if let Some(c) = self.ivars().controls.get() {
+                workspace::layout(self);
+                c.framing.preview.layout();
+            }
         }
     }
 
     impl AppDelegate {
         #[unsafe(method(tick:))]
         fn tick(&self, _timer: &NSTimer) {
+            if !self.ivars().quitting.get() || self.ivars().quit_after_group.get() { self.poll_previews(); }
+            if self.ivars().last_slow_tick.get().elapsed() < Duration::from_millis(200) { return; }
+            self.ivars().last_slow_tick.set(Instant::now());
             let result = self.ivars().discovery.borrow().as_ref().map(|rx| rx.try_recv());
             match result {
                 Some(Ok(catalog)) => {
@@ -164,6 +199,7 @@ define_class!(
                     state.message = format!("Settings not saved: {error}. Check the settings directory and press Apply to retry.");
                     state.dirty = true;
                     if self.ivars().quitting.replace(false) {
+                        self.ivars().quit_after_group.set(false);
                         NSApplication::sharedApplication(self.mtm()).replyToApplicationShouldTerminate(false);
                     }
                 } else {
@@ -173,15 +209,22 @@ define_class!(
                 }
             }
             // New edits made during a save are sent once that save completes.
-            if !self.ivars().saver.borrow().failed { self.save(); }
+            if !self.ivars().saver.borrow().failed
+                && self.ivars().viewport_edited.get().is_none_or(|time| time.elapsed() >= Duration::from_millis(400))
+            {
+                self.ivars().viewport_edited.set(None);
+                self.save();
+            }
             self.poll_capture();
-            if self.ivars().quitting.get() && !self.ivars().saver.borrow().pending && !self.ivars().state.borrow().dirty && self.ivars().capture.borrow().is_finished() {
+            self.poll_group();
+            self.advance_group_quit();
+            if self.ivars().quitting.get() && !self.ivars().quit_after_group.get() && !self.ivars().saver.borrow().pending && !self.ivars().state.borrow().dirty && self.ivars().capture.borrow().is_finished() {
                 NSApplication::sharedApplication(self.mtm()).replyToApplicationShouldTerminate(true);
             }
             self.refresh_status();
             if self.ivars().smoke_directory.is_some() && !self.ivars().smoke_started.get() { self.smoke_actions(); }
             if self.ivars().smoke_started.get() && !self.ivars().quitting.get() && !self.ivars().saver.borrow().pending && !self.ivars().state.borrow().dirty {
-                println!("Oculi native UI smoke: PASS (source dialogs, cancel, edit, cards, output validation, deletion confirmation, settings window, resize, asynchronous save)");
+                println!("Oculi native UI smoke: PASS (source dialogs, cards, framing controls, independent edits, synthetic Metal presentation, tracking-mode ticks, fixed canvas, preview layers, lifecycle, output validation, settings window, resize, asynchronous save, group controls and real backend rejection)");
                 self.ivars().quitting.set(true);
                 // Do not nest termination inside this timer: NSTimer cannot fire
                 // again until this invocation returns, including during a modal quit.
@@ -219,6 +262,28 @@ define_class!(
             self.controls().global.window.center();
             self.controls().global.window.makeKeyAndOrderFront(None);
         }
+
+        #[unsafe(method(showFraming:))]
+        fn show_framing(&self, _sender: &NSObject) {
+            self.flush_viewport_edit();
+            if !self.commit_editor(false) { return; }
+            let state = self.ivars().state.borrow();
+            if let Some(recording) = state.selected() {
+                self.controls().framing.show(recording, state.can_save);
+            }
+        }
+
+        #[unsafe(method(applyFraming:))]
+        fn apply_framing(&self, _sender: &NSObject) { self.edit_framing("apply"); }
+
+        #[unsafe(method(fitFraming:))]
+        fn fit_framing(&self, _sender: &NSObject) { self.edit_framing("fit"); }
+
+        #[unsafe(method(fillFraming:))]
+        fn fill_framing(&self, _sender: &NSObject) { self.edit_framing("fill"); }
+
+        #[unsafe(method(resetFraming:))]
+        fn reset_framing(&self, _sender: &NSObject) { self.edit_framing("reset"); }
 
         #[unsafe(method(toggleDrawer:))]
         fn toggle_drawer(&self, _sender: &NSButton) {
@@ -265,6 +330,7 @@ define_class!(
 
         #[unsafe(method(chooseDirectory:))]
         fn choose_directory(&self, _sender: &NSButton) {
+            if !self.ivars().state.borrow().configuration_editable() { return; }
             let panel = NSOpenPanel::openPanel(self.mtm());
             panel.setCanChooseDirectories(true);
             panel.setCanChooseFiles(false);
@@ -275,6 +341,7 @@ define_class!(
                 && let Some(url) = panel.URL()
                 && let Some(path) = url.path()
             {
+                if !self.ivars().state.borrow().configuration_editable() { return; }
                 self.controls().directory.setStringValue(&path);
                 if self.commit_editor(false) { self.save(); }
             }
@@ -294,6 +361,15 @@ define_class!(
 
         #[unsafe(method(requestScreen:))]
         fn request_screen(&self, _sender: &NSButton) { permissions::request_screen(); }
+
+        #[unsafe(method(startGroup:))]
+        fn start_group(&self, _sender: &NSObject) { self.start_recordings(); }
+
+        #[unsafe(method(pauseGroup:))]
+        fn pause_group(&self, _sender: &NSObject) { self.pause_recordings(); }
+
+        #[unsafe(method(stopGroup:))]
+        fn stop_group(&self, _sender: &NSObject) { self.stop_recordings(); }
     }
 );
 
@@ -317,9 +393,14 @@ impl AppDelegate {
             audios: RefCell::new(Vec::new()),
             discovery: RefCell::new(None),
             last_refresh: Cell::new(Instant::now()),
+            last_slow_tick: Cell::new(Instant::now()),
+            viewport_edited: Cell::new(None),
             device_refresh_due: Cell::new(false),
             timer: RefCell::new(None),
             quitting: Cell::new(false),
+            quit_after_group: Cell::new(false),
+            quit_stop_sent: Cell::new(false),
+            group_menu: OnceCell::new(),
             smoke_directory,
             smoke_started: Cell::new(false),
             drawer_open: Cell::new(true),
@@ -328,12 +409,22 @@ impl AppDelegate {
             video_reselected: Cell::new(false),
             delete_alert: RefCell::new(None),
             smoke_phase: Cell::new(0),
+            smoke_preview: RefCell::new(None),
+            smoke_preview_ticks: Cell::new(0),
+            smoke_tracking_ticks: Cell::new(0),
         });
         unsafe { msg_send![super(this), init] }
     }
 
     fn smoke_actions(&self) {
         let c = self.controls();
+        if objc2_foundation::NSRunLoop::mainRunLoop()
+            .currentMode()
+            .as_deref()
+            == Some(unsafe { NSEventTrackingRunLoopMode })
+        {
+            return;
+        }
         if c.window.attachedSheet().is_some() {
             return;
         }
@@ -428,6 +519,19 @@ impl AppDelegate {
                         .iter()
                         .all(|button| !button.isEnabled())
                 );
+                self.smoke_click(sel!(startGroup:));
+                assert!(!self.ivars().state.borrow().configuration_locked());
+                assert!(
+                    self.ivars()
+                        .state
+                        .borrow()
+                        .message
+                        .contains("available video and audio")
+                );
+                let before = self.ivars().state.borrow().settings.recordings.clone();
+                self.smoke_click(sel!(pauseGroup:));
+                self.smoke_click(sel!(stopGroup:));
+                assert_eq!(self.ivars().state.borrow().settings.recordings, before);
                 self.smoke_click(sel!(toggleDrawer:));
                 assert!(!self.ivars().drawer_open.get());
                 self.smoke_click(sel!(toggleDrawer:));
@@ -453,6 +557,7 @@ impl AppDelegate {
                     c.window.isVisible(),
                     "Closing settings closed the workspace"
                 );
+                self.smoke_framing();
                 self.save_smoke_image("workspace.png");
                 let appearance = NSAppearance::appearanceNamed(&ns("NSAppearanceNameAqua"))
                     .expect("light appearance");
@@ -467,6 +572,106 @@ impl AppDelegate {
             8 => {
                 self.save_smoke_image("workspace-dark.png");
                 c.window.setAppearance(None);
+                self.smoke_start_presentation();
+            }
+            9 => {
+                // Occlusion state arrives asynchronously after showing the window.
+                if !c.framing.preview.visible() {
+                    assert!(
+                        self.ivars().smoke_preview_ticks.get() < 90,
+                        "Framing window never became visible. Native presentation smoke requires an unlocked desktop and an unobscured Framing window. window={}, miniaturized={}, occlusion={:?}, visible_flag={:?}, owner={:?}, view={:?}, hidden={}, button={}, message={}",
+                        c.framing.window.isVisible(),
+                        c.framing.window.isMiniaturized(),
+                        c.framing.window.occlusionState(),
+                        NSWindowOcclusionState::Visible,
+                        c.framing.preview.view.window().map(|w| (
+                            w.windowNumber(),
+                            w.isVisible(),
+                            w.occlusionState()
+                        )),
+                        c.framing.preview.view.visibleRect(),
+                        c.framing.preview.view.isHiddenOrHasHiddenAncestor(),
+                        c.workspace.framing.isEnabled(),
+                        self.ivars().state.borrow().message,
+                    );
+                    return;
+                }
+                self.smoke_check_presentation();
+                self.smoke_begin_presentation_drag();
+                // Run outside this timer invocation so the actual preview timer can fire.
+                dispatch2::DispatchQueue::main().exec_async(|| {
+                    let run_loop = objc2_foundation::NSRunLoop::mainRunLoop();
+                    let until = objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.25);
+                    while until.timeIntervalSinceNow() > 0.0 {
+                        run_loop.runMode_beforeDate(unsafe { NSEventTrackingRunLoopMode }, &until);
+                    }
+                });
+            }
+            10 => {
+                assert!(self.ivars().smoke_preview_ticks.get() >= 3);
+                c.framing.preview.smoke_check_gpu_completion();
+                assert!(
+                    self.ivars().smoke_tracking_ticks.get() >= 3,
+                    "Preview timer stopped during event tracking"
+                );
+                self.smoke_check_presentation();
+                let workspace = self.save_smoke_window(&c.window, "workspace-live.png");
+                let framing = self.save_smoke_window(&c.framing.window, "framing.png");
+                c.framing.preview.smoke_check_orientation(&framing);
+                let id = self.ivars().smoke_preview.borrow().as_ref().unwrap().0;
+                c.workspace.smoke_check_orientation(id, &workspace);
+                self.smoke_end_presentation_drag();
+                c.framing.preview.smoke_show_handles(false);
+            }
+            11 => {
+                let clean = self.save_smoke_window(&c.framing.window, "framing-clean.png");
+                c.framing.preview.smoke_check_orientation(&clean);
+                c.framing.preview.smoke_show_handles(true);
+                self.smoke_check_canvas_change();
+                self.ivars().smoke_preview.borrow_mut().take();
+                c.framing.window.performClose(None);
+            }
+            12 => {
+                // No capture targets are enabled in normal UI smoke. Exercise
+                // actual backend preflight rejection, never simulated encoding.
+                let result = self
+                    .ivars()
+                    .capture
+                    .borrow()
+                    .group_command(crate::model::GroupCommand::Start, Vec::new());
+                if let Err(error) = result {
+                    assert!(!error.is_empty());
+                    self.show_error(&error);
+                    self.ivars().smoke_started.set(true);
+                }
+                self.ivars().smoke_preview_ticks.set(0);
+            }
+            13 => {
+                let state = self.ivars().state.borrow();
+                if state.group.state != crate::model::GroupState::Failed {
+                    let ticks = self.ivars().smoke_preview_ticks.get() + 1;
+                    self.ivars().smoke_preview_ticks.set(ticks);
+                    assert!(
+                        ticks < 100,
+                        "Backend did not reject empty recording group within 20 seconds"
+                    );
+                    return;
+                }
+                assert!(
+                    state
+                        .group
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| !error.is_empty())
+                );
+                assert!(!state.configuration_locked());
+                assert!(c.workspace.add.isEnabled());
+                assert!(
+                    c.workspace
+                        .group_buttons
+                        .iter()
+                        .all(|button| !button.isEnabled())
+                );
                 self.ivars().smoke_started.set(true);
             }
             _ => unreachable!(),
@@ -513,8 +718,33 @@ impl AppDelegate {
         assert!(png.writeToFile_atomically(&ns(&path.to_string_lossy()), true));
     }
 
+    fn save_smoke_window(&self, window: &NSWindow, filename: &str) -> std::path::PathBuf {
+        // AppKit's bitmap caching does not include CAMetalLayer drawables. Capture
+        // this application's composited window instead, including sibling handles.
+        let path = self
+            .ivars()
+            .smoke_directory
+            .as_ref()
+            .unwrap()
+            .join(filename);
+        let status = std::process::Command::new("/usr/sbin/screencapture")
+            .args(["-x", "-o", &format!("-l{}", window.windowNumber())])
+            .arg(&path)
+            .status()
+            .expect("capture composited smoke window");
+        assert!(
+            status.success(),
+            "Cannot capture {} (check screen recording permission)",
+            path.display()
+        );
+        assert!(path.metadata().unwrap().len() > 0);
+        path
+    }
+
     fn open_source(&self, draft: RecordingConfig, is_new: bool) {
-        if !self.ivars().state.borrow().can_save || self.ivars().source_draft.borrow().is_some() {
+        if !self.ivars().state.borrow().configuration_editable()
+            || self.ivars().source_draft.borrow().is_some()
+        {
             return;
         }
         let c = self.controls();
@@ -586,7 +816,9 @@ impl AppDelegate {
     }
 
     fn confirm_delete(&self) {
-        if !self.ivars().state.borrow().can_save || self.ivars().delete_alert.borrow().is_some() {
+        if !self.ivars().state.borrow().configuration_editable()
+            || self.ivars().delete_alert.borrow().is_some()
+        {
             return;
         }
         let Some(recording) = self.ivars().state.borrow().selected().cloned() else {
@@ -635,6 +867,10 @@ impl AppDelegate {
     }
 
     fn commit_editor(&self, _video_reselected: bool) -> bool {
+        // Selection and framing remain available while source/output fields are locked.
+        if !self.ivars().state.borrow().configuration_editable() {
+            return true;
+        }
         let Some(c) = self.ivars().controls.get() else {
             return true;
         };
@@ -671,10 +907,15 @@ impl AppDelegate {
             self.show_error(&error);
             return false;
         }
-        self.ivars()
+        let result = self
+            .ivars()
             .state
             .borrow_mut()
-            .replace_selected(recording, false);
+            .apply_output(recording.id, recording.output);
+        if let Err(error) = result {
+            self.show_error(&error);
+            return false;
+        }
         true
     }
 
@@ -688,14 +929,17 @@ impl AppDelegate {
         let c = self.controls();
         let state = self.ivars().state.borrow();
         let selected = state.selected();
-        let enabled = selected.is_some() && state.can_save;
+        let enabled = selected.is_some() && state.configuration_editable();
         for field in [&c.directory, &c.template, &c.width, &c.height, &c.fps] {
             field.setEnabled(enabled);
         }
-        c.workspace.add.setEnabled(state.can_save);
+        c.workspace.add.setEnabled(state.configuration_editable());
         for button in &c.edit_buttons {
             button.setEnabled(enabled);
         }
+        c.workspace
+            .framing
+            .setEnabled(selected.is_some() && state.can_save);
         if let Some(recording) = selected {
             c.directory
                 .setStringValue(&ns(&recording.output.directory.to_string_lossy()));
@@ -817,7 +1061,7 @@ impl AppDelegate {
             Some(r) if state.needs_window_reselection(r.id) => {
                 "Reselect this window: saved window IDs are not stable across app launches.".into()
             }
-            Some(r) => state.capture_summary(r.id),
+            Some(r) => state.recording_summary(r.id),
             None => "Add a recording to select its video, audio and destination.".into(),
         };
         c.status.setStringValue(&ns(&status));
@@ -828,13 +1072,20 @@ impl AppDelegate {
         if !state.capture.shutdown_errors.is_empty() {
             guidance.push_str(&format!("\n{}", state.capture.shutdown_errors.join("\n")));
         }
+        if let Some(error) = &state.group.error {
+            guidance.push_str(&format!("\nRecording: {error}"));
+        }
         c.guidance.setStringValue(&ns(&guidance));
         c.message
-            .setStringValue(&ns(if self.ivars().quitting.get() {
+            .setStringValue(&ns(if self.ivars().quit_after_group.get() {
+                "Waiting for Stop & Save to finish before quitting…"
+            } else if self.ivars().quitting.get() {
                 "Stopping capture and saving settings…"
             } else {
                 &state.message
             }));
+        drop(state);
+        self.refresh_group_controls();
     }
 
     fn button(
@@ -862,6 +1113,7 @@ impl AppDelegate {
         let workspace = workspace::build(self);
         let source = dialogs::source(self);
         let global = dialogs::global(self);
+        let framing = viewport::Framing::new(self);
         let _ = self.ivars().controls.set(Controls {
             window: workspace.window.clone(),
             name: source.name.clone(),
@@ -879,6 +1131,7 @@ impl AppDelegate {
             workspace,
             source,
             global,
+            framing,
         });
         workspace::layout(self);
         self.controls().window.center();
@@ -960,6 +1213,7 @@ pub fn run(smoke_directory: Option<std::path::PathBuf>) {
     }
     edit_item.setSubmenu(Some(&edit));
     menu.addItem(&edit_item);
+    group::build_menu(&delegate, &menu);
     app.setMainMenu(Some(&menu));
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     app.run();

@@ -104,15 +104,16 @@ pub enum AudioSourceSelector {
 /// `[0, 1]` so they remain meaningful across source resolution changes.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ViewportTransform {
-    /// Crop rectangle in normalized source coordinates (0..1).
+    /// Crop rectangle in normalized, top-left source coordinates (0..1).
     pub crop_x: f64,
     pub crop_y: f64,
     pub crop_width: f64,
     pub crop_height: f64,
-    /// Placement of the cropped content within the fixed output canvas,
-    /// normalized to the canvas size (0..1).
+    /// Translation from centered aspect fit, normalized to canvas dimensions.
+    /// Positive x moves right; positive y moves down. Valid range is [-100, 100].
     pub offset_x: f64,
     pub offset_y: f64,
+    /// Multiplier of centered cropped-source aspect fit; valid range (0, 100].
     pub scale: f64,
 }
 
@@ -131,16 +132,18 @@ impl Default for ViewportTransform {
 }
 
 impl ViewportTransform {
-    /// Resets crop and placement to show the entire source, scaled to fill
-    /// the canvas while preserving aspect ratio (see `render::transform` in
-    /// a later step for the actual geometry math).
+    /// Resets to the entire source, centered and aspect-fit inside the canvas.
+    /// Uncovered pixels are black; see `render::transform` for geometry.
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
     /// Returns true if the crop rectangle is within valid normalized bounds.
     pub fn is_crop_valid(&self) -> bool {
-        self.crop_x >= 0.0
+        [self.crop_x, self.crop_y, self.crop_width, self.crop_height]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.crop_x >= 0.0
             && self.crop_y >= 0.0
             && self.crop_width > 0.0
             && self.crop_height > 0.0
