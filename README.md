@@ -51,7 +51,9 @@ ad-hoc signed, not notarized. The script sets the macOS 15 deployment target.
   substituting another device. Playback audio is independent of the video filter.
 - Diagnostic video is latest-only, so skipped-sample counters include deliberate
   replacement of older frames. Audio queues are bounded; overflow is an explicit
-  capture error. Writer subscriptions and recording overload handling come later.
+  capture error. Atomic subscriber snapshots and bounded concurrent queues keep
+  routine source refresh, cleanup, and polling from dropping audio on mutex contention.
+  Writer subscriptions and recording overload handling come later.
 - Open **Oculi → Settings…** (`⌘,`) for global permissions and source discovery.
   Settings opens in its own window; appearance follows the macOS light/dark mode.
 - Video categories include cameras, displays, windows, and applications on each

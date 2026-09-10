@@ -1,9 +1,12 @@
 //! Worker-owned native sessions with nonblocking, bounded subscriber delivery.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+
+use arc_swap::ArcSwap;
+use crossbeam_queue::ArrayQueue;
 
 use super::{
     CaptureBackend, CaptureError, CaptureFormat, CaptureRequest, CaptureSession, SourceKey,
@@ -21,7 +24,7 @@ pub struct SubscriptionStats {
     pub received: u64,
     /// Queue evictions, rejected samples, and native/fanout drops since registration.
     pub dropped: u64,
-    /// Zero if the queue is currently busy; querying stats never waits for delivery.
+    /// Approximate queue length; querying stats never locks delivery.
     pub queued: usize,
 }
 
@@ -68,7 +71,7 @@ impl Drop for TerminalError {
 struct Subscriber<T> {
     alive: AtomicBool,
     policy: SubscriptionPolicy,
-    queue: Mutex<VecDeque<T>>,
+    queue: ArrayQueue<T>,
     error: TerminalError,
     received: AtomicU64,
     dropped: AtomicU64,
@@ -91,9 +94,9 @@ struct Delivery<T> {
     audio: bool,
     error: TerminalError,
     dropped: AtomicU64,
-    // Only registration/reaping changes membership. Callbacks briefly try-lock to
-    // clone a stable snapshot, then release this lock before touching any queues.
-    subscribers: Mutex<Arc<Vec<Arc<Subscriber<T>>>>>,
+    // Only the registry worker changes membership. Callbacks read an immutable
+    // snapshot without contending with registration, inspection, or reaping.
+    subscribers: ArcSwap<Vec<Arc<Subscriber<T>>>>,
 }
 
 impl<T> Delivery<T> {
@@ -134,42 +137,32 @@ impl<T: Clone + Send + 'static> SamplePublisher<T> {
         if !delivery.active.load(Ordering::Acquire) || delivery.error.is_set() {
             return;
         }
-        let subscribers = match delivery.subscribers.try_lock() {
-            Ok(subscribers) => subscribers.clone(),
-            Err(_) => {
-                delivery.note_drop();
-                return;
-            }
-        };
+        let subscribers = delivery.subscribers.load();
         for subscriber in subscribers.iter() {
             if !subscriber.alive.load(Ordering::Acquire) || subscriber.error.is_set() {
                 continue;
             }
-            let Ok(mut queue) = subscriber.queue.try_lock() else {
-                subscriber.drop_sample();
-                continue;
-            };
             if !delivery.active.load(Ordering::Acquire) || delivery.error.is_set() {
                 return;
             }
             match subscriber.policy {
                 SubscriptionPolicy::Latest => {
-                    if queue.pop_front().is_some() {
+                    if subscriber.queue.force_push(sample.clone()).is_some() {
                         subscriber.dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                SubscriptionPolicy::Bounded { capacity, .. } if queue.len() >= capacity => {
-                    subscriber.drop_sample();
-                    continue;
+                SubscriptionPolicy::Bounded { .. } => {
+                    if subscriber.queue.push(sample.clone()).is_err() {
+                        subscriber.drop_sample();
+                        continue;
+                    }
                 }
-                SubscriptionPolicy::Bounded { .. } => {}
             }
-            queue.push_back(sample.clone());
             subscriber.received.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// Terminal failure is out-of-band: even a full or locked queue observes it.
+    /// Terminal failure is out-of-band: even a full queue observes it.
     pub fn fail(&self, error: CaptureError) {
         if self.delivery.active.load(Ordering::Acquire) {
             self.delivery.error.set(error);
@@ -192,7 +185,7 @@ pub struct CaptureLease<T: Clone + Send + 'static> {
 
 impl<T: Clone + Send + 'static> CaptureLease<T> {
     pub fn try_recv(&self) -> Option<T> {
-        self.subscriber.queue.try_lock().ok()?.pop_front()
+        self.subscriber.queue.pop()
     }
 
     pub fn error(&self) -> Option<CaptureError> {
@@ -213,12 +206,7 @@ impl<T: Clone + Send + 'static> CaptureLease<T> {
                     .dropped
                     .load(Ordering::Relaxed)
                     .saturating_sub(self.subscriber.initial_shared_drops),
-            queued: self
-                .subscriber
-                .queue
-                .try_lock()
-                .map(|queue| queue.len())
-                .unwrap_or(0),
+            queued: self.subscriber.queue.len(),
         }
     }
 }
@@ -317,7 +305,7 @@ impl<T: Clone + Send + 'static, B: CaptureBackend<T>> CaptureRegistry<T, B> {
             audio: request.source.is_audio(),
             error: TerminalError::default(),
             dropped: AtomicU64::new(0),
-            subscribers: Mutex::new(Arc::new(Vec::new())),
+            subscribers: ArcSwap::from_pointee(Vec::new()),
         });
         // Register before start: a backend may deliver synchronously during startup.
         let lease = Self::register(delivery.clone(), policy);
@@ -346,14 +334,14 @@ impl<T: Clone + Send + 'static, B: CaptureBackend<T>> CaptureRegistry<T, B> {
     }
 
     fn register(delivery: Arc<Delivery<T>>, policy: SubscriptionPolicy) -> CaptureLease<T> {
-        let mut subscribers = delivery
-            .subscribers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let subscribers = delivery.subscribers.load();
         let subscriber = Arc::new(Subscriber {
             alive: AtomicBool::new(true),
             policy,
-            queue: Mutex::new(VecDeque::new()),
+            queue: ArrayQueue::new(match policy {
+                SubscriptionPolicy::Latest => 1,
+                SubscriptionPolicy::Bounded { capacity, .. } => capacity,
+            }),
             error: TerminalError::default(),
             received: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -365,7 +353,7 @@ impl<T: Clone + Send + 'static, B: CaptureBackend<T>> CaptureRegistry<T, B> {
             .cloned()
             .collect();
         members.push(subscriber.clone());
-        *subscribers = Arc::new(members);
+        delivery.subscribers.store(Arc::new(members));
         drop(subscribers);
         CaptureLease {
             subscriber,
@@ -380,18 +368,20 @@ impl<T: Clone + Send + 'static, B: CaptureBackend<T>> CaptureRegistry<T, B> {
             .sessions
             .iter()
             .filter_map(|(source, session)| {
-                let mut subscribers = session
-                    .delivery
-                    .subscribers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let members: Vec<_> = subscribers
+                let subscribers = session.delivery.subscribers.load();
+                let alive = subscribers
                     .iter()
                     .filter(|member| member.alive.load(Ordering::Acquire))
-                    .cloned()
-                    .collect();
-                let unused = members.is_empty();
-                *subscribers = Arc::new(members);
+                    .count();
+                let unused = alive == 0;
+                if alive != subscribers.len() {
+                    let members = subscribers
+                        .iter()
+                        .filter(|member| member.alive.load(Ordering::Acquire))
+                        .cloned()
+                        .collect();
+                    session.delivery.subscribers.store(Arc::new(members));
+                }
                 (unused || session.delivery.error.is_set()).then(|| source.clone())
             })
             .collect();
@@ -444,8 +434,7 @@ impl<T: Clone + Send + 'static, B: CaptureBackend<T>> CaptureRegistry<T, B> {
                 session
                     .delivery
                     .subscribers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .load()
                     .iter()
                     .filter(|member| member.alive.load(Ordering::Acquire))
                     .count()
@@ -549,6 +538,63 @@ mod tests {
 
     fn bounded(capacity: usize, audio: bool) -> SubscriptionPolicy {
         SubscriptionPolicy::Bounded { capacity, audio }
+    }
+
+    #[test]
+    fn inspecting_membership_must_not_drop_audio() {
+        let (mut registry, state) = registry();
+        let lease = registry.subscribe(audio(), bounded(4, true)).unwrap();
+        let publisher = state.borrow().publishers[0].clone();
+        let _snapshot = publisher.delivery.subscribers.load();
+        publisher.publish(42);
+        assert_eq!(lease.error(), None);
+        assert_eq!(lease.try_recv(), Some(42));
+        assert_eq!(lease.stats().dropped, 0);
+    }
+
+    #[test]
+    fn concurrent_audio_delivery_and_registry_maintenance_preserve_every_sample() {
+        const COUNT: u32 = 20_000;
+        let (mut registry, state) = registry();
+        let lease = registry
+            .subscribe(audio(), bounded(COUNT as usize, true))
+            .unwrap();
+        let publisher = state.borrow().publishers[0].clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let start = barrier.clone();
+        let producer = thread::spawn(move || {
+            start.wait();
+            for sample in 0..COUNT {
+                publisher.publish(sample);
+                if sample % 8 == 0 {
+                    thread::yield_now();
+                }
+            }
+        });
+        barrier.wait();
+        let mut received = Vec::new();
+        for iteration in 0..COUNT {
+            if iteration % 16 == 0 {
+                let temporary = registry
+                    .subscribe(audio(), bounded(COUNT as usize, true))
+                    .unwrap();
+                drop(temporary);
+            }
+            registry.reap().unwrap();
+            let _ = registry.subscriber_count(&audio().source);
+            let _ = lease.stats();
+            if let Some(sample) = lease.try_recv() {
+                received.push(sample);
+            }
+        }
+        producer.join().unwrap();
+        while let Some(sample) = lease.try_recv() {
+            received.push(sample);
+        }
+        assert_eq!(lease.error(), None);
+        assert_eq!(lease.stats().dropped, 0);
+        assert_eq!(lease.stats().received, u64::from(COUNT));
+        assert_eq!(received, (0..COUNT).collect::<Vec<_>>());
     }
 
     #[test]
@@ -773,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn receiver_contention_drops_video_and_does_not_block_other_subscribers() {
+    fn undrained_latest_video_does_not_block_other_subscribers() {
         let (mut registry, state) = registry();
         let slow = registry
             .subscribe(video(), SubscriptionPolicy::Latest)
@@ -782,31 +828,32 @@ mod tests {
             .subscribe(video(), SubscriptionPolicy::Latest)
             .unwrap();
         let publisher = state.borrow().publishers[0].clone();
-        let guard = slow.subscriber.queue.lock().unwrap();
+        publisher.publish(41);
+        assert_eq!(fast.try_recv(), Some(41));
         publisher.publish(42);
-        assert_eq!(slow.try_recv(), None);
         assert_eq!(slow.stats().dropped, 1);
         assert_eq!(slow.error(), None);
         assert_eq!(fast.try_recv(), Some(42));
-        drop(guard);
+        assert_eq!(slow.try_recv(), Some(42));
         publisher.publish(43);
         assert_eq!(slow.try_recv(), Some(43));
     }
 
     #[test]
-    fn receiver_contention_fails_audio_out_of_band_without_blocking() {
+    fn inspecting_audio_queue_does_not_prevent_delivery() {
         let (mut registry, state) = registry();
         let lease = registry.subscribe(audio(), bounded(1, true)).unwrap();
-        let guard = lease.subscriber.queue.lock().unwrap();
+        let queue = &lease.subscriber.queue;
+        assert!(queue.is_empty());
         state.borrow().publishers[0].publish(42);
-        assert!(matches!(lease.error(), Some(CaptureError::Overload(_))));
-        assert_eq!(lease.stats().dropped, 1);
-        drop(guard);
-        assert_eq!(lease.try_recv(), None);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(lease.error(), None);
+        assert_eq!(lease.stats().dropped, 0);
+        assert_eq!(lease.try_recv(), Some(42));
     }
 
     #[test]
-    fn membership_contention_counts_video_drops_for_current_subscribers() {
+    fn membership_inspection_preserves_video_and_native_drops_are_counted() {
         let (mut registry, state) = registry();
         let first = registry
             .subscribe(video(), SubscriptionPolicy::Latest)
@@ -815,11 +862,13 @@ mod tests {
             .subscribe(video(), SubscriptionPolicy::Latest)
             .unwrap();
         let publisher = state.borrow().publishers[0].clone();
-        let guard = publisher.delivery.subscribers.lock().unwrap();
+        let guard = publisher.delivery.subscribers.load();
         publisher.publish(1);
-        assert_eq!(first.stats().dropped, 1);
-        assert_eq!(second.stats().dropped, 1);
-        assert_eq!(first.try_recv(), None);
+        assert_eq!(first.stats().dropped, 0);
+        assert_eq!(second.stats().dropped, 0);
+        assert_eq!(first.try_recv(), Some(1));
+        assert_eq!(second.try_recv(), Some(1));
+        publisher.note_drop();
         drop(guard);
         let late = registry
             .subscribe(video(), SubscriptionPolicy::Latest)
@@ -834,17 +883,21 @@ mod tests {
     }
 
     #[test]
-    fn membership_contention_fails_all_audio_subscribers() {
+    fn membership_replacement_preserves_audio_for_current_subscribers() {
         let (mut registry, state) = registry();
         let first = registry.subscribe(audio(), bounded(1, true)).unwrap();
         let second = registry.subscribe(audio(), bounded(1, true)).unwrap();
         let publisher = state.borrow().publishers[0].clone();
-        let _guard = publisher.delivery.subscribers.lock().unwrap();
+        let snapshot = publisher.delivery.subscribers.load();
+        let third = registry.subscribe(audio(), bounded(1, true)).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(registry.subscriber_count(&audio().source), 3);
         publisher.publish(1);
-        assert!(matches!(first.error(), Some(CaptureError::Overload(_))));
-        assert_eq!(second.error(), first.error());
-        assert_eq!(first.stats().dropped, 1);
-        assert_eq!(second.stats().dropped, 1);
+        for lease in [&first, &second, &third] {
+            assert_eq!(lease.error(), None);
+            assert_eq!(lease.stats().dropped, 0);
+            assert_eq!(lease.try_recv(), Some(1));
+        }
     }
 
     #[test]
@@ -854,7 +907,7 @@ mod tests {
         let second = registry.subscribe(audio(), bounded(1, true)).unwrap();
         let publisher = state.borrow().publishers[0].clone();
         publisher.publish(1);
-        let _guard = first.subscriber.queue.lock().unwrap();
+        assert_eq!(first.stats().queued, 1);
         publisher.note_drop();
         assert!(matches!(first.error(), Some(CaptureError::Overload(_))));
         assert_eq!(second.error(), first.error());
@@ -863,13 +916,13 @@ mod tests {
     }
 
     #[test]
-    fn callback_failure_never_waits_for_membership_or_receiver_locks() {
+    fn callback_failure_is_visible_with_retained_membership_and_full_queue() {
         let (mut registry, state) = registry();
         let lease = registry.subscribe(video(), bounded(1, false)).unwrap();
         let publisher = state.borrow().publishers[0].clone();
         publisher.publish(1);
-        let _members = publisher.delivery.subscribers.lock().unwrap();
-        let _queue = lease.subscriber.queue.lock().unwrap();
+        let _members = publisher.delivery.subscribers.load();
+        assert_eq!(lease.stats().queued, 1);
         let failure = CaptureError::Permission("Revoked".into());
         publisher.fail(failure.clone());
         assert_eq!(lease.error(), Some(failure));
