@@ -108,7 +108,13 @@ open -n -W target/debug/Oculi.app --args --device-smoke-test "$PWD/target/smoke/
 The new report file contains the bundle identity, each device's PASS/FAIL/SKIP,
 and a completion marker. This explicit check does not open the workspace, change
 saved configurations, prompt for permissions, or save media. It checks the default
-camera and microphone sequentially and stops each session. A missing permission
+camera at 640×480, 1920×1080, and 1000×560, then the microphone, stopping each
+session. Camera reports include native input dimensions separately from the
+validated output dimensions. Cameras without input-priority support retain
+automatic native input negotiation; AVFoundation's output conversion scales to
+the requested dimensions with aspect fit, rather than requiring that sensor
+format. This does not increase the camera's native frame rate; recording cadence
+handling remains part of the planned writer work. A missing permission
 is still a skip, not successful verification; rebuilding an ad-hoc signed app may
 require macOS to grant access again.
 

@@ -18,12 +18,16 @@ use objc2_av_foundation::{
     AVCaptureSessionPresetInputPriority, AVCaptureSessionRuntimeErrorNotification,
     AVCaptureSessionWasInterruptedNotification, AVCaptureVideoDataOutput,
     AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeAudio, AVMediaTypeVideo,
+    AVVideoScalingModeKey, AVVideoScalingModeResizeAspect,
 };
 use objc2_core_media::{
     CMAudioFormatDescriptionGetStreamBasicDescription, CMFormatDescription, CMSampleBuffer, CMTime,
     CMTimeFlags, CMVideoFormatDescriptionGetDimensions, kCMMediaType_Audio, kCMMediaType_Video,
 };
-use objc2_core_video::{kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA};
+use objc2_core_video::{
+    kCVPixelBufferHeightKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVPixelFormatType_32BGRA,
+};
 use objc2_foundation::{
     NSDictionary, NSError, NSNotification, NSNotificationCenter, NSNumber, NSObject,
     NSObjectProtocol, NSString,
@@ -183,6 +187,17 @@ fn numeric_time(time: CMTime) -> bool {
         && !time.flags.intersects(CMTimeFlags::ImpliedValueFlagsMask)
 }
 
+fn matches_video_output(
+    width: i32,
+    height: i32,
+    pixel_format: u32,
+    requested: CaptureFormat,
+) -> bool {
+    matches!(requested, CaptureFormat::Video { width: w, height: h, .. }
+        if width > 0 && height > 0 && width as u32 == w && height as u32 == h
+            && pixel_format == kCVPixelFormatType_32BGRA)
+}
+
 unsafe fn validate_sample(
     buffer: &CMSampleBuffer,
     requested: CaptureFormat,
@@ -210,13 +225,18 @@ unsafe fn validate_sample(
                     ));
                 }
                 let dimensions = CMVideoFormatDescriptionGetDimensions(&description);
-                if dimensions.width < width as i32
-                    || dimensions.height < height as i32
-                    || description.media_sub_type() != kCVPixelFormatType_32BGRA
-                    || buffer.image_buffer().is_none()
+                if !matches_video_output(
+                    dimensions.width,
+                    dimensions.height,
+                    description.media_sub_type(),
+                    requested,
+                ) || buffer.image_buffer().is_none()
                 {
                     return Err(CaptureError::UnsupportedFormat(format!(
-                        "Camera did not deliver BGRA at least {width}x{height}; select a smaller format"
+                        "Camera output conversion did not deliver BGRA {width}x{height}; received {}x{} (pixel format {:#x})",
+                        dimensions.width,
+                        dimensions.height,
+                        description.media_sub_type()
                     )));
                 }
                 Ok(SampleKind::Video)
@@ -292,6 +312,39 @@ fn choose_video_format(
         .map(|(index, _)| index)
 }
 
+fn camera_output_settings(
+    width: u32,
+    height: u32,
+) -> Result<Retained<NSDictionary<NSString, AnyObject>>, CaptureError> {
+    // macOS uncompressed video output accepts Core Video dimensions and an
+    // AVFoundation scaling mode. Conversion belongs to the output, not the
+    // camera input; aspect-fit preserves the whole image without distortion.
+    unsafe {
+        let (Some(scaling_key), Some(scaling_mode)) =
+            (AVVideoScalingModeKey, AVVideoScalingModeResizeAspect)
+        else {
+            return Err(CaptureError::UnsupportedFormat(
+                "Camera output scaling is unavailable on this system".into(),
+            ));
+        };
+        let pixel_key = NSString::from_str(&kCVPixelBufferPixelFormatTypeKey.to_string());
+        let width_key = NSString::from_str(&kCVPixelBufferWidthKey.to_string());
+        let height_key = NSString::from_str(&kCVPixelBufferHeightKey.to_string());
+        let pixel = NSNumber::new_u32(kCVPixelFormatType_32BGRA);
+        let width = NSNumber::new_u32(width);
+        let height = NSNumber::new_u32(height);
+        Ok(NSDictionary::from_slices(
+            &[&*pixel_key, &*width_key, &*height_key, scaling_key],
+            &[
+                pixel.as_ref(),
+                width.as_ref(),
+                height.as_ref(),
+                scaling_mode.as_ref(),
+            ],
+        ))
+    }
+}
+
 fn configure_camera(
     device: &AVCaptureDevice,
     width: u32,
@@ -336,12 +389,16 @@ fn configure_camera(
                 native.push((format.clone(), duration));
             }
         }
-        let index = choose_video_format(&candidates, width, height, fps).ok_or_else(|| {
-            CaptureError::UnsupportedFormat(format!(
-                "Camera {} has no format at least {width}x{height} at {fps} fps; lower resolution/frame rate or select another camera",
+        let Some(index) = choose_video_format(&candidates, width, height, fps) else {
+            // Output sizing is independent of the camera's native formats.
+            // Preserve a working session-selected format when no exact-capacity
+            // input is available rather than rejecting an otherwise usable device.
+            log::warn!(
+                "Camera {} will use its session-selected format for {width}x{height} at {fps} fps; native cadence may be lower",
                 device.localizedName()
-            ))
-        })?;
+            );
+            return Ok(());
+        };
         device.lockForConfiguration().map_err(|error| {
             native_error(
                 "Could not lock camera configuration; close other camera applications and retry",
@@ -603,14 +660,20 @@ fn start_native(
         let delegate = DeviceDelegate::new(state.clone());
         let output = match request.format {
             CaptureFormat::Video { width, height, fps } => {
-                if !session.canSetSessionPreset(AVCaptureSessionPresetInputPriority) {
-                    return Err(CaptureError::UnsupportedFormat("Camera does not support explicit input-priority formats; select another camera".into()));
+                if session.canSetSessionPreset(AVCaptureSessionPresetInputPriority) {
+                    session.beginConfiguration();
+                    session.setSessionPreset(AVCaptureSessionPresetInputPriority);
+                    let configured = configure_camera(&device, width, height, fps);
+                    session.commitConfiguration();
+                    configured?;
+                } else {
+                    // Some cameras only support session-selected native formats.
+                    // Do not send active-format/frame-duration setters to them.
+                    log::info!(
+                        "Camera {} uses automatic input format negotiation",
+                        device.localizedName()
+                    );
                 }
-                session.setSessionPreset(AVCaptureSessionPresetInputPriority);
-                session.beginConfiguration();
-                let configured = configure_camera(&device, width, height, fps);
-                session.commitConfiguration();
-                configured?;
                 let output = AVCaptureVideoDataOutput::new();
                 if !session.canAddOutput(&output) {
                     return Err(CaptureError::UnsupportedFormat(
@@ -627,12 +690,7 @@ fn start_native(
                         "Camera cannot produce BGRA; select another camera format".into(),
                     ));
                 }
-                let pixel_key = NSString::from_str(&kCVPixelBufferPixelFormatTypeKey.to_string());
-                let pixel = NSNumber::new_u32(kCVPixelFormatType_32BGRA);
-                let settings = NSDictionary::<NSString, AnyObject>::from_slices(
-                    &[&*pixel_key],
-                    &[pixel.as_ref()],
-                );
+                let settings = camera_output_settings(width, height)?;
                 output.setVideoSettings(Some(&settings));
                 output.setAlwaysDiscardsLateVideoFrames(true);
                 output.setSampleBufferDelegate_queue(
@@ -752,9 +810,29 @@ fn validate_smoke_metadata(
 }
 
 /// Explicit, non-prompting native check for bundled CLI callers. Blocks while a
-/// dedicated worker captures three samples and verifies idempotent, quiescent stop.
+/// dedicated worker captures three samples per format and verifies idempotent,
+/// quiescent stop. Cameras exercise standard and non-native output sizes.
 /// Missing permission or hardware is reported as SKIP, never as verified capture.
 pub fn smoke_check(camera: bool) -> Result<String, String> {
+    if !camera {
+        return smoke_check_format(CaptureFormat::Audio {
+            sample_rate: 48_000,
+            channels: 1,
+        });
+    }
+    let mut reports = Vec::new();
+    for (width, height, fps) in [(640, 480, 15), (1920, 1080, 30), (1000, 560, 30)] {
+        let report = smoke_check_format(CaptureFormat::Video { width, height, fps })?;
+        if report.starts_with("SKIP") {
+            return Ok(report);
+        }
+        reports.push(report);
+    }
+    Ok(reports.join("\n"))
+}
+
+fn smoke_check_format(format: CaptureFormat) -> Result<String, String> {
+    let camera = matches!(format, CaptureFormat::Video { .. });
     let label = if camera { "camera" } else { "microphone" };
     std::thread::Builder::new()
         .name(format!("oculi.{label}.smoke"))
@@ -804,18 +882,7 @@ pub fn smoke_check(camera: bool) -> Result<String, String> {
                 } else {
                     SourceKey::Microphone(id)
                 },
-                format: if camera {
-                    CaptureFormat::Video {
-                        width: 640,
-                        height: 480,
-                        fps: 15,
-                    }
-                } else {
-                    CaptureFormat::Audio {
-                        sample_rate: 48_000,
-                        channels: 1,
-                    }
-                },
+                format,
             };
             let (tx, rx) = mpsc::sync_channel(4);
             let state = Arc::new(CallbackState {
@@ -825,6 +892,20 @@ pub fn smoke_check(camera: bool) -> Result<String, String> {
             });
             let mut session = start_native(&request, state.clone())
                 .map_err(|error| format!("{label} start failed: {error}"))?;
+            let input_description = if camera {
+                // SAFETY: Read the worker-owned device's negotiated input only;
+                // this is deliberately separate from the validated output size.
+                unsafe {
+                    let active = session._device.activeFormat();
+                    let description: *const CMFormatDescription = msg_send![&*active, formatDescription];
+                    description.as_ref().map(|description| {
+                        let size = CMVideoFormatDescriptionGetDimensions(description);
+                        format!("native input {}x{}, preset {}", size.width, size.height, session.session.sessionPreset())
+                    }).unwrap_or_else(|| "native input dimensions unavailable".into())
+                }
+            } else {
+                "native audio input".into()
+            };
             let capture_result = (|| {
                 let expected = if camera { SampleKind::Video } else { SampleKind::Audio };
                 let mut previous = None;
@@ -868,7 +949,7 @@ pub fn smoke_check(camera: bool) -> Result<String, String> {
                 return Err(errors.join("; "));
             }
             Ok(format!(
-                "PASS {label}: 3 real native samples, negotiated media/format, expected kind, strictly advancing PTS and idempotent/quiescent stop verified"
+                "PASS {label}: {format:?}; {input_description}; 3 real native samples, exact output dimensions/format, expected kind, strictly advancing PTS and idempotent/quiescent stop verified"
             ))
         }))
         .map_err(|error| format!("{label} smoke worker could not start: {error}"))?
@@ -879,6 +960,68 @@ pub fn smoke_check(camera: bool) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_conversion_settings_are_independent_of_input_dimensions() {
+        for (width, height) in [(640, 480), (1920, 1080), (1000, 560)] {
+            let settings = camera_output_settings(width, height).unwrap();
+            unsafe {
+                for (key, expected) in [
+                    (kCVPixelBufferWidthKey, width),
+                    (kCVPixelBufferHeightKey, height),
+                    (kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA),
+                ] {
+                    let value = settings
+                        .objectForKey(&NSString::from_str(&key.to_string()))
+                        .unwrap();
+                    let actual: u32 = msg_send![&*value, unsignedIntValue];
+                    assert_eq!(actual, expected);
+                }
+                let mode = settings
+                    .objectForKey(AVVideoScalingModeKey.unwrap())
+                    .unwrap();
+                let equal: bool =
+                    msg_send![&*mode, isEqual: AVVideoScalingModeResizeAspect.unwrap()];
+                assert!(
+                    equal,
+                    "scaling must preserve aspect ratio, not stretch/crop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn camera_samples_must_match_converted_output_not_native_input() {
+        let requested = CaptureFormat::Video {
+            width: 1000,
+            height: 560,
+            fps: 30,
+        };
+        assert!(matches_video_output(
+            1000,
+            560,
+            kCVPixelFormatType_32BGRA,
+            requested
+        ));
+        for (width, height) in [(1920, 1080), (640, 480), (0, 560), (-1, 560), (1000, 0)] {
+            assert!(!matches_video_output(
+                width,
+                height,
+                kCVPixelFormatType_32BGRA,
+                requested
+            ));
+        }
+        assert!(!matches_video_output(1000, 560, 0, requested));
+        assert!(!matches_video_output(
+            1000,
+            560,
+            kCVPixelFormatType_32BGRA,
+            CaptureFormat::Audio {
+                sample_rate: 48_000,
+                channels: 1
+            }
+        ));
+    }
 
     #[test]
     fn chooses_smallest_compatible_camera_format() {
