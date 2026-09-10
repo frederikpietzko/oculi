@@ -2,6 +2,9 @@
 
 A native Rust/AppKit multi-recording app for macOS 15+.
 
+For project development, see [AGENTS.md](AGENTS.md) for the code map, safety
+contracts, and Junie skills for native UI, media pipelines, and macOS verification.
+
 ## Current implementation
 
 The native workspace shows every configured video/audio pair as a preview card,
