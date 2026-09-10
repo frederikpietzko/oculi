@@ -2,5 +2,61 @@
 name = "oculi"
 version = "0.1.0"
 edition = "2024"
+default-run = "oculi"
+
+[lib]
+name = "oculi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "oculi"
+path = "src/main.rs"
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
+log = "0.4"
+env_logger = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+block2 = "=0.6.2"
+objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSArray", "NSDictionary", "NSError", "NSNotification", "NSRunLoop", "NSData"] }
+objc2-app-kit = { version = "=0.3.2", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSTableView",
+    "NSTableColumn",
+    "NSSplitView",
+    "NSButton",
+    "NSPopUpButton",
+    "NSTextField",
+    "NSStackView",
+    "NSMenu",
+    "NSMenuItem",
+    "NSOpenPanel",
+    "NSSavePanel",
+    "NSColor",
+    "NSFont",
+    "NSResponder",
+    "NSControl",
+    "NSNib",
+    "NSScrollView",
+] }
+objc2-av-foundation = { version = "=0.3.2", features = [
+    "AVCaptureDevice",
+    "AVMediaFormat",
+    "AVCaptureSession",
+] }
+objc2-screen-capture-kit = { version = "=0.3.2", features = [
+    "SCShareableContent",
+] }
+objc2-core-foundation = "=0.3.2"
+objc2-core-graphics = "=0.3.2"
+
+[dev-dependencies]
+tempfile = "3"
