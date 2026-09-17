@@ -93,6 +93,8 @@ and produces a signed, notarized, stapled ZIP; it never falls back to ad-hoc sig
 - Video categories include cameras, displays, windows, and applications on each
   display. Audio categories include input devices, application playback, and
   system playback. Selecting application audio does not restrict it to one window.
+- Microphone/input-device audio is captured as mono and centered in both channels
+  of the stereo AAC recording. Application and system playback retain stereo.
 - Sources refresh in the background, with device-change notifications and periodic
   screen-content refresh. Unavailable sources stay selected; no substitute is chosen.
 - Saved windows require explicit reselection after restarting because window IDs

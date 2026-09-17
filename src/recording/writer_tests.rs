@@ -15,6 +15,11 @@ fn settings(width: u32, height: u32) -> OutputSettings {
 
 /// Permission-independent PCM with CF-owned storage and no borrowed callbacks.
 pub(super) fn synthetic_tone(frames: usize, planar: bool) -> NativeSample {
+    synthetic_tone_channels(frames, planar, 2)
+}
+
+fn synthetic_tone_channels(frames: usize, planar: bool, channels: u32) -> NativeSample {
+    assert!((1..=2).contains(&channels));
     unsafe {
         let mut asbd = AudioStreamBasicDescription {
             mSampleRate: 48_000.0,
@@ -26,10 +31,10 @@ pub(super) fn synthetic_tone(frames: usize, planar: bool) -> NativeSample {
                 } else {
                     0
                 },
-            mBytesPerPacket: if planar { 4 } else { 8 },
+            mBytesPerPacket: if planar { 4 } else { 4 * channels },
             mFramesPerPacket: 1,
-            mBytesPerFrame: if planar { 4 } else { 8 },
-            mChannelsPerFrame: 2,
+            mBytesPerFrame: if planar { 4 } else { 4 * channels },
+            mChannelsPerFrame: channels,
             mBitsPerChannel: 32,
             mReserved: 0,
         };
@@ -78,21 +83,21 @@ pub(super) fn synthetic_tone(frames: usize, planar: bool) -> NativeSample {
         let tone = |index: usize| {
             ((index as f64 * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 0.2) as f32
         };
-        let mut left: Vec<f32> = if planar {
+        let mut left: Vec<f32> = if planar || channels == 1 {
             (0..frames).map(tone).collect()
         } else {
             (0..frames).flat_map(|i| [tone(i), -tone(i)]).collect()
         };
-        let mut right: Vec<f32> = if planar {
+        let mut right: Vec<f32> = if planar && channels == 2 {
             (0..frames).map(|i| -tone(i)).collect()
         } else {
             Vec::new()
         };
         let mut list = PcmBuffers {
-            count: if planar { 2 } else { 1 },
+            count: if planar { channels } else { 1 },
             buffers: [
                 AudioBuffer {
-                    mNumberChannels: if planar { 1 } else { 2 },
+                    mNumberChannels: if planar { 1 } else { channels },
                     mDataByteSize: (left.len() * 4) as u32,
                     mData: left.as_mut_ptr().cast(),
                 },
@@ -137,6 +142,133 @@ fn finish(handle: &FinishHandle) {
         assert!(Instant::now() < deadline, "native finalization timeout");
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+#[test]
+fn native_aac_centers_mono_and_preserves_stereo_channels() {
+    let directory = tempfile::tempdir_in("target").unwrap();
+    let directory = directory.path().canonicalize().unwrap();
+    let output = settings(80, 40);
+    let mut renderer = Renderer::new().unwrap();
+    let frame = renderer
+        .render(
+            &synthetic_sample(80, 40).unwrap(),
+            ViewportTransform::default(),
+            output.resolution,
+        )
+        .unwrap();
+    for channels in [1, 2] {
+        for planar in [false, true] {
+            let path = directory.join(format!("channels-{channels}-planar-{planar}.mp4"));
+            let mut writer = Writer::prepare(&path, &output).unwrap();
+            let pcm = synthetic_tone_channels(48_000, planar, channels);
+            for index in 0..10 {
+                let timestamp = index as f64 / 10.0;
+                retry(|| writer.append_video(&frame, timestamp));
+                retry(|| writer.append_audio(&pcm, index * 4_800, 4_800, timestamp));
+            }
+            finish(&writer.finish(1.0).unwrap());
+            let values = decode_audio_channels(&path);
+            assert!(values.len() >= 48_000, "missing decoded audio");
+            let mut energy = [0.0f64; 2];
+            let mut cross = 0.0f64;
+            for [left, right] in &values {
+                energy[0] += f64::from(*left).powi(2);
+                energy[1] += f64::from(*right).powi(2);
+                cross += f64::from(*left) * f64::from(*right);
+            }
+            for power in energy {
+                assert!(
+                    power / values.len() as f64 > 0.005,
+                    "silent channel: {energy:?}"
+                );
+            }
+            assert!(
+                (energy[0] / energy[1] - 1.0).abs() < 0.05,
+                "unbalanced: {energy:?}"
+            );
+            let correlation = cross / (energy[0] * energy[1]).sqrt();
+            if channels == 1 {
+                assert!(correlation > 0.99, "mono not centered: {correlation}");
+            } else {
+                assert!(correlation < -0.99, "stereo collapsed: {correlation}");
+            }
+        }
+    }
+}
+
+#[allow(deprecated)]
+fn decode_audio_channels(path: &Path) -> Vec<[f32; 2]> {
+    #[link(name = "AVFAudio", kind = "framework")]
+    unsafe extern "C" {
+        static AVLinearPCMBitDepthKey: &'static NSString;
+        static AVLinearPCMIsFloatKey: &'static NSString;
+        static AVLinearPCMIsBigEndianKey: &'static NSString;
+        static AVLinearPCMIsNonInterleaved: &'static NSString;
+    }
+    autoreleasepool(|_| unsafe {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str().unwrap()));
+        let asset = AVURLAsset::URLAssetWithURL_options(&url, None);
+        let tracks = asset.tracksWithMediaType(AVMediaTypeAudio.unwrap());
+        assert_eq!(tracks.len(), 1);
+        let track = tracks.objectAtIndex(0);
+        let reader = AVAssetReader::assetReaderWithAsset_error(&asset).unwrap();
+        let settings = dictionary(&[
+            (AVFormatIDKey, &*NSNumber::new_u32(kAudioFormatLinearPCM)),
+            (AVLinearPCMBitDepthKey, &*NSNumber::new_u32(32)),
+            (AVLinearPCMIsFloatKey, &*NSNumber::new_bool(true)),
+            (AVLinearPCMIsBigEndianKey, &*NSNumber::new_bool(false)),
+            (AVLinearPCMIsNonInterleaved, &*NSNumber::new_bool(false)),
+        ]);
+        let output = AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(
+            &track,
+            Some(&settings),
+        );
+        assert!(reader.canAddOutput(&output));
+        reader.addOutput(&output);
+        assert!(reader.startReading());
+        let mut values = Vec::new();
+        while let Some(sample) = output.copyNextSampleBuffer() {
+            let frames = sample.num_samples();
+            if frames == 0 {
+                continue;
+            }
+            let format = sample.format_description().unwrap();
+            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(&format)
+                .as_ref()
+                .unwrap();
+            assert_eq!(asbd.mChannelsPerFrame, 2);
+            assert_eq!(asbd.mBytesPerFrame, 8);
+            assert_eq!(asbd.mSampleRate, 48_000.0);
+            assert_ne!(asbd.mFormatFlags & kAudioFormatFlagIsFloat, 0);
+            assert_eq!(asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved, 0);
+            let mut data = vec![[0f32; 2]; frames as usize];
+            let mut list = AudioBufferList {
+                mNumberBuffers: 1,
+                mBuffers: [AudioBuffer {
+                    mNumberChannels: 2,
+                    mDataByteSize: (data.len() * 8) as u32,
+                    mData: data.as_mut_ptr().cast(),
+                }],
+            };
+            assert_eq!(
+                sample.copy_pcm_data_into_audio_buffer_list(
+                    0,
+                    frames as i32,
+                    NonNull::from(&mut list)
+                ),
+                0
+            );
+            values.extend(data);
+        }
+        assert_eq!(
+            reader.status(),
+            AVAssetReaderStatus::Completed,
+            "{:?}",
+            reader.error()
+        );
+        values
+    })
 }
 
 #[test]

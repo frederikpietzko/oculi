@@ -461,13 +461,20 @@ impl AppState {
             if recording.audio_availability == SourceAvailability::Available
                 && let Some(source) = SourceKey::audio(&recording.audio)
             {
+                // Capture voice as mono; the AAC writer centers it in stereo.
+                // Forcing stereo here can leave single-input devices left-only.
+                let channels = if matches!(source, SourceKey::Microphone(_)) {
+                    1
+                } else {
+                    2
+                };
                 targets.push(CaptureTarget {
                     recording: recording.id,
                     request: CaptureRequest {
                         source,
                         format: CaptureFormat::Audio {
                             sample_rate: 48_000,
-                            channels: 2,
+                            channels,
                         },
                     },
                 });
@@ -1105,6 +1112,46 @@ mod tests {
         }
         assert!(state.group_summary().contains("01:01:01"));
         assert!(!state.configuration_locked());
+    }
+
+    #[test]
+    fn microphone_capture_is_mono_while_playback_remains_stereo() {
+        use crate::model::{AudioSourceSelector, BundleId, DeviceId};
+
+        let mut state = AppState::from_settings(PersistedSettings::default());
+        state.add();
+        for (audio, channels) in [
+            (
+                AudioSourceSelector::Microphone {
+                    device_id: DeviceId("microphone".into()),
+                    label: "Microphone".into(),
+                },
+                1,
+            ),
+            (
+                AudioSourceSelector::Application {
+                    bundle_id: BundleId("app".into()),
+                    label: "Application".into(),
+                },
+                2,
+            ),
+            (AudioSourceSelector::System, 2),
+        ] {
+            let source = SourceKey::audio(&audio).unwrap();
+            let recording = &mut state.settings.recordings[0];
+            recording.audio = audio;
+            recording.audio_availability = SourceAvailability::Available;
+            let targets = state.capture_targets();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].request.source, source);
+            assert_eq!(
+                targets[0].request.format,
+                CaptureFormat::Audio {
+                    sample_rate: 48_000,
+                    channels,
+                }
+            );
+        }
     }
 
     #[test]
