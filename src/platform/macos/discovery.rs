@@ -11,7 +11,7 @@
 //! All Objective-C objects stay on their worker/callback thread. Only owned
 //! Rust selectors, strings, and synchronization primitives cross threads.
 
-use super::permissions;
+use super::{application_identity, permissions};
 use crate::discovery::{SourceCatalog, same_audio, same_video};
 use crate::model::{
     AudioSourceSelector, BundleId, DeviceId, DisplayId, Resolution, VideoSourceSelector, WindowId,
@@ -439,7 +439,6 @@ struct Application {
 struct Window {
     pid: i32,
     frame: Rect,
-    on_screen: bool,
 }
 
 fn pixel_resolution(width: f64, height: f64, scale: f64) -> Option<Resolution> {
@@ -502,10 +501,15 @@ fn screen_catalog(content: &SCShareableContent) -> SourceCatalog {
             }
             catalog.videos.push(source);
         }
-        for app in content.applications().iter() {
+        for app in application_identity::shareable_applications(content) {
+            let (bundle, label) = application_identity::resolve_metadata(
+                app.processID(),
+                app.bundleIdentifier().to_string(),
+                app.applicationName().to_string(),
+            );
             applications.push(Application {
-                bundle: app.bundleIdentifier().to_string(),
-                label: app.applicationName().to_string(),
+                bundle,
+                label,
                 pid: app.processID(),
             });
         }
@@ -516,21 +520,16 @@ fn screen_catalog(content: &SCShareableContent) -> SourceCatalog {
                 .as_ref()
                 .map(|a| a.bundleIdentifier().to_string())
                 .filter(|s| !s.is_empty());
-            if let Some(owner) = owner {
-                applications.push(Application {
-                    bundle: owner.bundleIdentifier().to_string(),
-                    label: owner.applicationName().to_string(),
-                    pid,
-                });
-            }
-            if pid == own_pid || window.windowLayer() != 0 {
+            if pid == own_pid {
                 continue;
             }
             windows.push(Window {
                 pid,
                 frame: window.frame().into(),
-                on_screen: window.isOnScreen(),
             });
+            if window.windowLayer() != 0 {
+                continue;
+            }
             let source = VideoSourceSelector::Window {
                 window_id: WindowId(window.windowID()),
                 owner_bundle_id: bundle.map(BundleId),
@@ -593,12 +592,15 @@ fn add_applications(
     audio_supported: bool,
 ) {
     let mut bundles: BTreeMap<String, BTreeMap<i32, String>> = BTreeMap::new();
+    let mut unbundled = BTreeMap::new();
     for app in applications {
         if app.bundle.is_empty() {
-            catalog.warnings.push(format!(
-                "Application {} has no bundle identifier; app-wide selection omitted.",
-                app.label
-            ));
+            if app.pid > 0 && app.pid != own_pid {
+                let label = unbundled.entry(app.pid).or_insert_with(String::new);
+                if label.trim().is_empty() {
+                    *label = app.label;
+                }
+            }
             continue;
         }
         bundles
@@ -612,6 +614,44 @@ fn add_applications(
         catalog
             .warnings
             .push("System and application audio require macOS 13 or newer.".into());
+    }
+    for (pid, label) in unbundled {
+        if bundles
+            .values()
+            .any(|instances| instances.contains_key(&pid))
+        {
+            continue;
+        }
+        let Some(metadata) = application_identity::process_metadata(pid) else {
+            catalog.warnings.push(format!(
+                "Application {} (PID {pid}) has no bundle identifier and its process identity could not be verified; app-wide selection omitted.",
+                if label.trim().is_empty() { "Unknown process" } else { &label },
+            ));
+            continue;
+        };
+        let label = if label.trim().is_empty() {
+            metadata.name
+        } else {
+            label
+        };
+        catalog.warnings.push(format!(
+            "Application {label} (PID {pid}) has no bundle identifier; session-only app-wide selection available. Reselect after restarting Oculi or the application.",
+        ));
+        if audio_supported {
+            catalog
+                .audios
+                .push(AudioSourceSelector::ApplicationProcess {
+                    process: metadata.id,
+                    label: label.clone(),
+                });
+        }
+        add_application_videos(catalog, displays, windows, pid, |display_id| {
+            VideoSourceSelector::ApplicationProcess {
+                process: metadata.id,
+                display_id,
+                label: label.clone(),
+            }
+        });
     }
     for (bundle, instances) in bundles {
         if instances.len() != 1 {
@@ -631,27 +671,41 @@ fn add_applications(
                 label: label.clone(),
             });
         }
-        for (display_id, frame) in displays {
-            if windows
-                .iter()
-                .any(|w| w.pid == pid && w.on_screen && w.frame.intersects(*frame))
-            {
-                let source = VideoSourceSelector::Application {
-                    bundle_id: BundleId(bundle.clone()),
-                    display_id: *display_id,
-                    label: format!("{label} — Display {}", display_id.0),
-                };
-                // Application capture uses a display-scoped canvas, not the
-                // bounding box of its windows or a different display's scale.
-                if let Some((_, resolutions)) = catalog.video_resolutions.iter().find(|(v, _)| {
-                    matches!(v, VideoSourceSelector::Display { display_id: id, .. } if id == display_id)
-                }) {
-                    catalog
-                        .video_resolutions
-                        .push((source.clone(), resolutions.clone()));
-                }
-                catalog.videos.push(source);
+        add_application_videos(catalog, displays, windows, pid, |display_id| {
+            VideoSourceSelector::Application {
+                bundle_id: BundleId(bundle.clone()),
+                display_id,
+                label: format!("{label} — Display {}", display_id.0),
             }
+        });
+    }
+}
+
+fn add_application_videos(
+    catalog: &mut SourceCatalog,
+    displays: &[(DisplayId, Rect)],
+    windows: &[Window],
+    pid: i32,
+    source: impl Fn(DisplayId) -> VideoSourceSelector,
+) {
+    for (display_id, frame) in displays {
+        // Shareable windows may report isOnScreen=false. Visibility must not
+        // hide their application or invalidate an existing selection.
+        if windows
+            .iter()
+            .any(|w| w.pid == pid && w.frame.intersects(*frame))
+        {
+            let source = source(*display_id);
+            // Application capture uses a display-scoped canvas, not the
+            // bounding box of its windows or a different display's scale.
+            if let Some((_, resolutions)) = catalog.video_resolutions.iter().find(|(v, _)| {
+                matches!(v, VideoSourceSelector::Display { display_id: id, .. } if id == display_id)
+            }) {
+                catalog
+                    .video_resolutions
+                    .push((source.clone(), resolutions.clone()));
+            }
+            catalog.videos.push(source);
         }
     }
 }
@@ -798,6 +852,174 @@ mod tests {
     }
 
     #[test]
+    fn application_video_remains_selectable_when_windows_are_not_on_screen() {
+        let pid = std::process::id() as i32;
+        let display = Rect {
+            x: 1728.0,
+            y: -323.0,
+            width: 5120.0,
+            height: 1440.0,
+        };
+        for bundle in ["com.jetbrains.intellij", ""] {
+            let mut catalog = SourceCatalog::default();
+            add_applications(
+                &mut catalog,
+                vec![Application {
+                    bundle: bundle.into(),
+                    label: "IntelliJ IDEA".into(),
+                    pid,
+                }],
+                &[
+                    (
+                        DisplayId(1),
+                        Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1728.0,
+                            height: 1117.0,
+                        },
+                    ),
+                    (DisplayId(2), display),
+                ],
+                &[
+                    Window {
+                        pid,
+                        frame: Rect {
+                            y: -322.0,
+                            width: 2560.0,
+                            ..display
+                        },
+                    },
+                    Window {
+                        pid: pid + 1,
+                        frame: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 100.0,
+                            height: 100.0,
+                        },
+                    },
+                ],
+                -1,
+                true,
+            );
+            assert_eq!(catalog.videos.len(), 1, "{bundle}: {:?}", catalog.videos);
+            match &catalog.videos[0] {
+                VideoSourceSelector::Application {
+                    bundle_id,
+                    display_id,
+                    ..
+                } => {
+                    assert_eq!(bundle_id.0, bundle);
+                    assert_eq!(*display_id, DisplayId(2));
+                }
+                VideoSourceSelector::ApplicationProcess {
+                    process,
+                    display_id,
+                    ..
+                } => {
+                    assert!(bundle.is_empty());
+                    assert_eq!(process.pid, pid);
+                    assert_eq!(*display_id, DisplayId(2));
+                }
+                source => panic!("Unexpected source: {source:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unbundled_application_is_offered_once_on_its_display() {
+        let pid = std::process::id() as i32;
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let mut catalog = SourceCatalog::default();
+        let resolutions = vec![Resolution {
+            width: 200,
+            height: 200,
+        }];
+        catalog.video_resolutions.push((
+            VideoSourceSelector::Display {
+                display_id: DisplayId(1),
+                label: "Display".into(),
+            },
+            resolutions.clone(),
+        ));
+        add_applications(
+            &mut catalog,
+            (0..4)
+                .map(|_| Application {
+                    bundle: String::new(),
+                    label: String::new(),
+                    pid,
+                })
+                .collect(),
+            &[
+                (DisplayId(1), rect),
+                (DisplayId(2), Rect { x: 100.0, ..rect }),
+            ],
+            &[
+                Window { pid, frame: rect },
+                Window { pid, frame: rect },
+                Window {
+                    pid: pid + 1,
+                    frame: rect,
+                },
+            ],
+            -1,
+            true,
+        );
+        assert_eq!(catalog.videos.len(), 1, "{:?}", catalog.warnings);
+        assert_eq!(catalog.audios.len(), 2);
+        assert_eq!(catalog.warnings.len(), 1);
+        assert!(catalog.warnings[0].contains(&format!("PID {pid}")));
+        assert!(catalog.warnings[0].contains("session-only"));
+        assert!(matches!(
+            &catalog.videos[0], VideoSourceSelector::ApplicationProcess { process, display_id: DisplayId(1), label }
+            if process.pid == pid && !label.trim().is_empty()
+        ));
+        assert_eq!(
+            catalog.video_resolutions[1],
+            (catalog.videos[0].clone(), resolutions)
+        );
+    }
+
+    #[test]
+    fn unbundled_audio_is_display_independent_and_own_or_unverifiable_processes_are_omitted() {
+        let pid = std::process::id() as i32;
+        for (own_pid, candidate, audio_supported, expected_audio) in [
+            (-1, pid, true, 2),
+            (pid, pid, true, 1),
+            (-1, i32::MAX, true, 1),
+            (-1, 0, true, 1),
+            (-1, pid, false, 0),
+        ] {
+            let mut catalog = SourceCatalog::default();
+            add_applications(
+                &mut catalog,
+                vec![Application {
+                    bundle: String::new(),
+                    label: String::new(),
+                    pid: candidate,
+                }],
+                &[],
+                &[],
+                own_pid,
+                audio_supported,
+            );
+            assert!(catalog.videos.is_empty());
+            assert_eq!(catalog.audios.len(), expected_audio);
+            if candidate == i32::MAX {
+                assert!(catalog.warnings[0].contains("could not be verified"));
+                assert!(catalog.warnings[0].contains(&format!("PID {candidate}")));
+            }
+        }
+    }
+
+    #[test]
     fn ambiguous_bundles_are_omitted_and_app_audio_is_display_independent() {
         let app = |bundle: &str, pid| Application {
             bundle: bundle.into(),
@@ -841,7 +1063,6 @@ mod tests {
             &[Window {
                 pid: 3,
                 frame: rect,
-                on_screen: true,
             }],
             9,
             true,
@@ -886,6 +1107,36 @@ mod tests {
                 assert!(!CHANGED.swap(false, Ordering::AcqRel));
             }
         });
+    }
+
+    #[test]
+    fn native_application_discovery_smoke() {
+        let Ok(bundle) = std::env::var("OCULI_APPLICATION_DISCOVERY_BUNDLE") else {
+            eprintln!(
+                "SKIPPED application discovery smoke: set OCULI_APPLICATION_DISCOVERY_BUNDLE to a running application's bundle ID."
+            );
+            return;
+        };
+        if !permissions::screen_granted() {
+            eprintln!(
+                "SKIPPED application discovery smoke: screen permission must already be granted; no prompt is issued."
+            );
+            return;
+        }
+        let catalog = refresh()
+            .recv_timeout(TIMEOUT + Duration::from_secs(2))
+            .expect("bounded discovery result");
+        let applications: Vec<_> = catalog.videos.iter().filter(|source| matches!(
+            source, VideoSourceSelector::Application { bundle_id, .. } if bundle_id.0 == bundle
+        )).collect();
+        assert!(
+            !applications.is_empty(),
+            "Application {bundle} is not selectable; warnings: {:?}",
+            catalog.warnings
+        );
+        for source in applications {
+            eprintln!("PASS application discovery: {source:?}");
+        }
     }
 
     #[test]

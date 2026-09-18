@@ -24,6 +24,7 @@ arc-swap = "=1.7.1"
 crossbeam-queue = "=0.3.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.189"
 objc2 = "=0.6.4"
 block2 = "=0.6.2"
 objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSArray", "NSDictionary", "NSError", "NSNotification", "NSRunLoop", "NSData"] }

@@ -1,3 +1,4 @@
+mod application_identity;
 pub mod capture;
 pub mod device_capture;
 pub mod discovery;

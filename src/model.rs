@@ -39,6 +39,15 @@ pub struct DeviceId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BundleId(pub String);
 
+/// One application process in this Oculi run; restored identities require reselection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ApplicationProcessId {
+    pub pid: i32,
+    pub start_time: [u64; 2],
+    #[serde(skip)]
+    pub session: Uuid,
+}
+
 /// Persistent identifier for a display, backed by `CGDirectDisplayID`.
 ///
 /// Display IDs may change across reboots/hotplug; discovery revalidates them
@@ -80,6 +89,12 @@ pub enum VideoSourceSelector {
         display_id: DisplayId,
         label: String,
     },
+    /// Session-only application process, captured on a given display.
+    ApplicationProcess {
+        process: ApplicationProcessId,
+        display_id: DisplayId,
+        label: String,
+    },
 }
 
 /// Selects the audio source for a recording. Independent of the video
@@ -95,6 +110,11 @@ pub enum AudioSourceSelector {
     Microphone { device_id: DeviceId, label: String },
     /// Audio played by a specific application (app-wide, not per-window).
     Application { bundle_id: BundleId, label: String },
+    /// Session-only application process audio, independent of display or window.
+    ApplicationProcess {
+        process: ApplicationProcessId,
+        label: String,
+    },
     /// All system audio output.
     System,
 }
@@ -321,6 +341,49 @@ pub enum GroupCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_process_serialization_never_restores_session_identity() {
+        let process = ApplicationProcessId {
+            pid: 42,
+            start_time: [123, 456],
+            session: Uuid::from_u128(1),
+        };
+        let mut json = serde_json::to_value(process).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"pid": 42, "start_time": [123, 456]})
+        );
+        // Even an explicitly supplied session cannot turn saved data into a live identity.
+        json["session"] = serde_json::to_value(process.session).unwrap();
+        let restored: ApplicationProcessId = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.pid, process.pid);
+        assert_eq!(restored.start_time, process.start_time);
+        assert!(restored.session.is_nil());
+        assert_ne!(restored, process);
+    }
+
+    #[test]
+    fn legacy_bundle_application_selectors_still_round_trip() {
+        let video = serde_json::json!({
+            "kind": "application", "bundle_id": "example.app", "display_id": 7, "label": "App"
+        });
+        let audio = serde_json::json!({
+            "kind": "application", "bundle_id": "example.app", "label": "App"
+        });
+        let restored_video: VideoSourceSelector = serde_json::from_value(video.clone()).unwrap();
+        let restored_audio: AudioSourceSelector = serde_json::from_value(audio.clone()).unwrap();
+        assert!(matches!(
+            restored_video,
+            VideoSourceSelector::Application { .. }
+        ));
+        assert!(matches!(
+            restored_audio,
+            AudioSourceSelector::Application { .. }
+        ));
+        assert_eq!(serde_json::to_value(restored_video).unwrap(), video);
+        assert_eq!(serde_json::to_value(restored_audio).unwrap(), audio);
+    }
 
     #[test]
     fn recording_config_duplicate_keeps_settings_but_changes_identity() {

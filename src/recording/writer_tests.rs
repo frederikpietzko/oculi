@@ -272,6 +272,141 @@ fn decode_audio_channels(path: &Path) -> Vec<[f32; 2]> {
 }
 
 #[test]
+fn wireless_pro_reported_timestamps_do_not_stop_recording() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut writer = Writer::prepare(
+        &directory.path().join("wireless-pro.mp4"),
+        &settings(80, 40),
+    )
+    .unwrap();
+    let pcm = synthetic_tone_channels(512, false, 1);
+    retry(|| writer.append_audio(&pcm, 0, 512, 29.052_461_148));
+    retry(|| writer.append_audio(&pcm, 0, 512, 29.062_824_996));
+    assert_eq!(writer.audio_timing.unwrap().start, 29.062_824_996);
+    let accepted = writer.audio_timing;
+    for timestamp in [29.062_824_996, 29.052_461_148, 29.063] {
+        assert!(writer.append_audio(&pcm, 0, 512, timestamp).is_err());
+        assert_eq!(writer.audio_timing, accepted);
+    }
+    unsafe {
+        writer.native.as_ref().unwrap().audio.markAsFinished();
+    }
+    for _ in 0..3 {
+        assert!(!writer.append_audio(&pcm, 0, 512, 29.074).unwrap());
+        assert_eq!(writer.audio_timing, accepted);
+    }
+}
+
+#[test]
+fn audio_jitter_budget_is_shared_not_renewed_for_each_buffer() {
+    let duration = 512.0 / 48_000.0;
+    let mut timing = AudioTiming::next(None, 29.052_461_148, duration, 48_000.0).unwrap();
+    // Repeating the reported overlap would be sustained ~2.8% clock error,
+    // not bounded phase jitter, even though each pair passes the local bound.
+    let step = 29.062_824_996 - 29.052_461_148;
+    for _ in 0..3 {
+        timing = AudioTiming::next(Some(timing), timing.start + step, duration, 48_000.0).unwrap();
+    }
+    let error =
+        AudioTiming::next(Some(timing), timing.start + step, duration, 48_000.0).unwrap_err();
+    assert!(error.contains("accumulate overlap"), "{error}");
+    for timestamp in [timing.start, timing.start - 0.01, timing.end - 0.002] {
+        assert!(AudioTiming::next(Some(timing), timestamp, duration, 48_000.0).is_err());
+    }
+    let after_gap = AudioTiming::next(Some(timing), timing.end + 2.0, duration, 48_000.0).unwrap();
+    assert_eq!(after_gap.minimum_next, after_gap.start + duration * 0.999);
+    let short = AudioTiming::next(None, 0.0, 16.0 / 48_000.0, 48_000.0).unwrap();
+    assert!(AudioTiming::next(Some(short), short.end - 0.00015, duration, 48_000.0).is_err());
+}
+
+#[test]
+fn audio_jitter_and_supported_drift_remain_bounded_over_long_sequences() {
+    for rate in [8_000.0, 44_100.0, 48_000.0, 192_000.0] {
+        for clock_scale in [0.999, 0.9995, 1.0, 1.0005] {
+            let mut timing = None;
+            let mut host = 123_456.25;
+            for index in 0..20_000 {
+                let frames = [512, 1_024, 441][index % 3];
+                let duration = frames as f64 / rate;
+                let jitter = [0.0, -0.0003, 0.0003, 0.0][index % 4] * (48_000.0 / rate).min(1.0);
+                let timestamp = host + jitter;
+                let next = AudioTiming::next(timing, timestamp, duration, rate).unwrap();
+                assert_eq!(next.start, timestamp);
+                assert_eq!(next.end, timestamp + duration);
+                timing = Some(next);
+                host += duration * clock_scale;
+            }
+        }
+    }
+}
+
+#[test]
+fn jittery_microphone_audio_encodes_through_pause_resume_without_rebasing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("microphone-jitter.mp4");
+    let output = settings(80, 40);
+    let mut writer = Writer::prepare(&path, &output).unwrap();
+    let pcm = synthetic_tone_channels(512, false, 1);
+    let mut renderer = Renderer::new().unwrap();
+    let frame = renderer
+        .render(
+            &synthetic_sample(80, 40).unwrap(),
+            ViewportTransform::default(),
+            output.resolution,
+        )
+        .unwrap();
+    let origin = 123_456.25;
+    let mut timeline = Timeline::new(origin + 0.00013).unwrap();
+    timeline.pause(origin + 10.00002).unwrap();
+    timeline.resume(origin + 11.01317).unwrap();
+    timeline.pause(origin + 20.001).unwrap();
+    timeline.resume(origin + 20.323).unwrap();
+    let duration = 512.0 / 48_000.0;
+    let buffers = 3_200;
+    let stop = origin + buffers as f64 * duration * 0.9995;
+    timeline.stop(stop).unwrap();
+    // Start video at the committed group origin, as the runtime cadence does;
+    // otherwise AVFoundation synthesizes a leading sample for the empty edit.
+    retry(|| writer.append_video(&frame, 0.0));
+    let mut video_frames = 1;
+    let mut pcm_frames = 0;
+    for index in 0..buffers {
+        let jitter = [0.0, -0.000302819, 0.000302819, 0.0][index % 4];
+        let host = origin + index as f64 * duration * 0.9995 + jitter;
+        if index % 10 == 0
+            && let Some(timestamp) = timeline.map(host)
+        {
+            retry(|| writer.append_video(&frame, timestamp));
+            video_frames += 1;
+        }
+        for span in timeline.audio_spans(host, 512, 48_000).unwrap() {
+            retry(|| writer.append_audio(&pcm, span.offset, span.frames, span.timestamp));
+            assert_eq!(writer.audio_timing.unwrap().start, span.timestamp);
+            pcm_frames += span.frames;
+        }
+    }
+    let end = timeline.elapsed(stop);
+    // Timeline trimming removes a partial final PCM frame. The MP4 track then
+    // quantizes that retained end to its own 48 kHz timebase, separately.
+    let retained_end = writer.audio_timing.unwrap().end;
+    assert!(retained_end <= end && end - retained_end < 1.0 / 48_000.0);
+    finish(&writer.finish(end).unwrap());
+    let decoded = decode(&path, output.resolution, &[(10, 10)]);
+    assert_eq!(decoded.pts.len(), video_frames);
+    assert!(decoded.audio_pts.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(decoded.audio_packets >= pcm_frames / 1_024);
+    assert!((decoded.audio_track_end - retained_end).abs() < 1.0 / 48_000.0);
+    assert!(decoded.audio_track_end <= end);
+    assert!((decoded.duration - end).abs() < 0.03);
+    let audio = decode_audio_channels(&path);
+    assert!(audio.len() > pcm_frames - 2_048);
+    let left_energy: f64 = audio.iter().map(|pair| f64::from(pair[0]).powi(2)).sum();
+    let right_energy: f64 = audio.iter().map(|pair| f64::from(pair[1]).powi(2)).sum();
+    assert!(left_energy > 1.0);
+    assert!((left_energy - right_energy).abs() / left_energy < 0.01);
+}
+
+#[test]
 fn host_clock_audio_drift_does_not_stop_recording() {
     let directory = tempfile::tempdir().unwrap();
     let output = settings(80, 40);
@@ -319,14 +454,22 @@ fn audio_clock_tolerance_is_bounded_and_never_accepts_reordered_buffers() {
         let previous = 0.25;
         let duration = frames as f64 / rate;
         let end = previous + duration;
-        assert!(validate_audio_timestamp(end, previous, end, rate).is_ok());
-        assert!(validate_audio_timestamp(end + 0.1, previous, end, rate).is_ok());
-        assert!(validate_audio_timestamp(previous + duration * 0.999, previous, end, rate).is_ok());
-        assert!(validate_audio_timestamp(previous, previous, end, rate).is_err());
-        assert!(validate_audio_timestamp(previous - 0.01, previous, end, rate).is_err());
+        assert!(validate_audio_timestamp(end, previous, end, rate, 0.0).is_ok());
+        assert!(validate_audio_timestamp(end + 0.1, previous, end, rate, 0.0).is_ok());
         assert!(
-            validate_audio_timestamp(end - 2.0 / rate - duration * 0.001, previous, end, rate)
-                .is_err()
+            validate_audio_timestamp(previous + duration * 0.999, previous, end, rate, 0.0).is_ok()
+        );
+        assert!(validate_audio_timestamp(previous, previous, end, rate, 0.0).is_err());
+        assert!(validate_audio_timestamp(previous - 0.01, previous, end, rate, 0.0).is_err());
+        assert!(
+            validate_audio_timestamp(
+                end - 2.0 / rate - duration * 0.001,
+                previous,
+                end,
+                rate,
+                0.0
+            )
+            .is_err()
         );
     }
 }
@@ -783,8 +926,7 @@ fn invalid_settings_destinations_samples_and_native_backpressure_are_explicit() 
         assert!(!writer.append_video(&frame, 0.0).unwrap());
         assert!(!writer.append_audio(&pcm, 0, 480, 0.0).unwrap());
         assert_eq!(writer.last_video, None);
-        assert_eq!(writer.last_audio, None);
-        assert_eq!(writer.audio_end, None);
+        assert_eq!(writer.audio_timing, None);
         writer.cancel();
         writer.cancel();
         assert!(writer.append_video(&frame, 0.0).is_err());

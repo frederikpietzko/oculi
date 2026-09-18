@@ -644,6 +644,105 @@ mod tests {
     use super::*;
     use crate::model::WindowId;
 
+    #[test]
+    fn restored_application_process_requires_separate_video_and_audio_reselection() {
+        use crate::model::{ApplicationProcessId, AudioSourceSelector, DisplayId};
+
+        let process = ApplicationProcessId {
+            pid: 42,
+            start_time: [123, 456],
+            session: uuid::Uuid::from_u128(1),
+        };
+        let mut live = RecordingConfig::new("Process");
+        live.video = VideoSourceSelector::ApplicationProcess {
+            process,
+            display_id: DisplayId(1),
+            label: "App".into(),
+        };
+        live.audio = AudioSourceSelector::ApplicationProcess {
+            process,
+            label: "App".into(),
+        };
+        let catalog = SourceCatalog {
+            videos: vec![live.video.clone()],
+            audios: vec![live.audio.clone()],
+            ..Default::default()
+        };
+        let settings = PersistedSettings {
+            recordings: vec![live.clone()],
+            ..Default::default()
+        };
+        let restored = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        let mut state = AppState::from_settings(restored);
+        for _ in 0..2 {
+            state.update_catalog(catalog.clone());
+            assert_eq!(
+                state.selected().unwrap().video_availability,
+                SourceAvailability::Unavailable
+            );
+            assert_eq!(
+                state.selected().unwrap().audio_availability,
+                SourceAvailability::Unavailable
+            );
+        }
+        let unchanged = state.selected().unwrap().clone();
+        state.apply_source_draft(unchanged, false, false).unwrap();
+        assert_eq!(
+            state.selected().unwrap().video_availability,
+            SourceAvailability::Unavailable
+        );
+        assert_eq!(
+            state.selected().unwrap().audio_availability,
+            SourceAvailability::Unavailable
+        );
+
+        let mut draft = state.selected().unwrap().clone();
+        draft.video = live.video.clone();
+        state.apply_source_draft(draft, false, true).unwrap();
+        assert_eq!(
+            state.selected().unwrap().video_availability,
+            SourceAvailability::Available
+        );
+        assert_eq!(
+            state.selected().unwrap().audio_availability,
+            SourceAvailability::Unavailable
+        );
+        let mut draft = state.selected().unwrap().clone();
+        draft.audio = live.audio.clone();
+        state.apply_source_draft(draft, false, false).unwrap();
+        assert_eq!(
+            state.selected().unwrap().audio_availability,
+            SourceAvailability::Available
+        );
+
+        let restarted = ApplicationProcessId {
+            start_time: [124, 456],
+            ..process
+        };
+        state.update_catalog(SourceCatalog {
+            videos: vec![VideoSourceSelector::ApplicationProcess {
+                process: restarted,
+                display_id: DisplayId(1),
+                label: "App".into(),
+            }],
+            audios: vec![AudioSourceSelector::ApplicationProcess {
+                process: restarted,
+                label: "App".into(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            state.selected().unwrap().video_availability,
+            SourceAvailability::Unavailable
+        );
+        assert_eq!(
+            state.selected().unwrap().audio_availability,
+            SourceAvailability::Unavailable
+        );
+        assert_eq!(state.selected().unwrap().video, live.video);
+        assert_eq!(state.selected().unwrap().audio, live.audio);
+    }
+
     fn resolution_catalog(first: &RecordingConfig, second: &RecordingConfig) -> SourceCatalog {
         SourceCatalog {
             videos: vec![second.video.clone(), first.video.clone()],

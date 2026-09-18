@@ -650,6 +650,7 @@ dependencies = [
  "crossbeam-queue",
  "dispatch2",
  "env_logger",
+ "libc",
  "log",
  "objc2",
  "objc2-app-kit",

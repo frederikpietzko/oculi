@@ -93,13 +93,30 @@ and produces a signed, notarized, stapled ZIP; it never falls back to ad-hoc sig
 - Video categories include cameras, displays, windows, and applications on each
   display. Audio categories include input devices, application playback, and
   system playback. Selecting application audio does not restrict it to one window.
+  Application video remains selectable when macOS marks its shareable windows as
+  off-screen, using their window bounds to identify displays. Listing a source
+  does not guarantee hidden/minimized windows or windows on another Space appear
+  in the recording; bring the desired UI onto the selected display to capture it.
 - Microphone/input-device audio is captured as mono and centered in both channels
   of the stereo AAC recording. Application and system playback retain stereo.
+  Bounded device timestamp jitter is tolerated without shifting audio away from
+  the group clock. Duplicate/backward buffers, excessive overlap, and sustained
+  clock error still stop recording rather than silently discarding audio.
 - Sources refresh in the background, with device-change notifications and periodic
   screen-content refresh. Unavailable sources stay selected; no substitute is chosen.
 - Saved windows require explicit reselection after restarting because window IDs
   can be recycled. Multiple instances with the same app bundle ID are not offered
   as an ambiguous application target.
+- Applications without a usable bundle ID can appear as **Session-only** process
+  targets, showing their process label and PID (and display for video). Reselect
+  both video and audio after restarting Oculi or the source process; saved process
+  targets are never silently matched to a reused PID. Application video can include
+  shareable popups belonging to the same process on the selected display; separate
+  helper applications are not automatically included. Process audio is independent
+  of the selected display and is not window-specific.
+  Executable paths can improve labels (for example, `IntelliJ IDEA (java)`), but
+  do not group separate PIDs: matching executable paths or labels never merges
+  different processes into one capture target.
 - Grant permissions using the explicit **Allow** buttons. If access was denied,
   use System Settings → Privacy & Security → Camera, Microphone, or Screen & System
   Audio Recording. macOS may require restarting the app after permission changes.
@@ -134,6 +151,11 @@ and `framing-clean.png` snapshots also verify displayed output separately from h
 It never uses the regular settings file. Native discovery smoke is opt-in via
 `OCULI_NATIVE_DISCOVERY_SMOKE=1 cargo test native_discovery_smoke -- --nocapture`;
 it reports skips if the required permissions are missing.
+
+For application-list diagnosis without starting capture or requiring camera/microphone
+access, run `OCULI_APPLICATION_DISCOVERY_BUNDLE=com.jetbrains.intellij cargo test
+native_application_discovery_smoke -- --nocapture`. It checks the actual catalog for
+that running application's video entry; missing screen permission is a SKIP.
 
 Capture adapter smoke tests are opt-in:
 

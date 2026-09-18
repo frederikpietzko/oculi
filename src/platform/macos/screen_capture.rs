@@ -7,13 +7,14 @@
 //! workers if SCK never completes. A caller deadline is not native cancellation.
 
 use super::{
-    permissions,
+    application_identity, permissions,
     sample::{NativeSample, SampleKind},
 };
 use crate::capture::{
     CaptureError, CaptureFormat, CaptureRequest, CaptureSession, SourceKey,
     registry::SamplePublisher,
 };
+use crate::model::ApplicationProcessId;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::{
@@ -329,10 +330,16 @@ unsafe fn application(
     }
     // SAFETY: Snapshot properties are read only on the lifecycle worker.
     unsafe {
-        let apps: Vec<_> = content
-            .applications()
-            .iter()
-            .filter(|app| app.bundleIdentifier().to_string() == bundle)
+        let apps: Vec<_> = application_identity::shareable_applications(content)
+            .into_iter()
+            .filter(|app| {
+                application_identity::resolve_metadata(
+                    app.processID(),
+                    app.bundleIdentifier().to_string(),
+                    app.applicationName().to_string(),
+                )
+                .0 == bundle
+            })
             .collect();
         let running = NSRunningApplication::runningApplicationsWithBundleIdentifier(
             &NSString::from_str(bundle),
@@ -355,6 +362,49 @@ unsafe fn application(
             .ok_or_else(|| {
                 CaptureError::Unavailable(format!("Application {bundle} is not shareable"))
             })
+    }
+}
+
+fn validate_process(process: &ApplicationProcessId) -> Result<(), CaptureError> {
+    if process.pid == std::process::id() as i32 {
+        return Err(CaptureError::Unavailable(
+            "Oculi cannot capture its own application".into(),
+        ));
+    }
+    if !application_identity::is_current(process) {
+        return Err(CaptureError::Unavailable(format!(
+            "Application process PID {} ended or changed; reselect the application",
+            process.pid,
+        )));
+    }
+    Ok(())
+}
+
+unsafe fn process_application(
+    content: &SCShareableContent,
+    process: &ApplicationProcessId,
+) -> Result<Retained<SCRunningApplication>, CaptureError> {
+    validate_process(process)?;
+    // SAFETY: Snapshot children stay retained on this lifecycle worker. Select
+    // the exact owning process, including owners only reported through windows.
+    let app = unsafe { application_identity::shareable_applications(content) }
+        .into_iter()
+        .find(|app| unsafe { app.processID() } == process.pid)
+        .ok_or_else(|| {
+            CaptureError::Unavailable(format!(
+                "Application process PID {} is not shareable",
+                process.pid,
+            ))
+        })?;
+    validate_process(process)?;
+    Ok(app)
+}
+
+fn selected_process(source: &SourceKey) -> Option<&ApplicationProcessId> {
+    match source {
+        SourceKey::ApplicationProcessVideo { process, .. }
+        | SourceKey::ApplicationProcessAudio(process) => Some(process),
+        _ => None,
     }
 }
 
@@ -391,8 +441,11 @@ unsafe fn filter(
         }
         let display_id = match source {
             SourceKey::Display(id) => Some(*id),
-            SourceKey::ApplicationVideo { display, .. } => Some(*display),
-            SourceKey::ApplicationAudio(_) | SourceKey::SystemAudio => None,
+            SourceKey::ApplicationVideo { display, .. }
+            | SourceKey::ApplicationProcessVideo { display, .. } => Some(*display),
+            SourceKey::ApplicationAudio(_)
+            | SourceKey::ApplicationProcessAudio(_)
+            | SourceKey::SystemAudio => None,
             _ => {
                 return Err(CaptureError::Unavailable(
                     "Not a ScreenCaptureKit source".into(),
@@ -406,25 +459,33 @@ unsafe fn filter(
             .min_by_key(|display| display.displayID())
             .ok_or_else(|| CaptureError::Unavailable("Selected display is unavailable".into()))?;
         let empty = NSArray::new();
-        match source {
+        let app = match source {
             SourceKey::ApplicationVideo { bundle, .. } | SourceKey::ApplicationAudio(bundle) => {
-                let app = application(content, bundle)?;
-                // Audio follows the application, not its visible windows or the
-                // display it happens to occupy. Never build a window audio filter.
-                Ok(
-                    SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(
-                        SCContentFilter::alloc(),
-                        &display,
-                        &NSArray::from_retained_slice(&[app]),
-                        &empty,
-                    ),
-                )
+                Some(application(content, bundle)?)
             }
-            _ => Ok(SCContentFilter::initWithDisplay_excludingWindows(
+            SourceKey::ApplicationProcessVideo { process, .. }
+            | SourceKey::ApplicationProcessAudio(process) => {
+                Some(process_application(content, process)?)
+            }
+            _ => None,
+        };
+        if let Some(app) = app {
+            // Include all shareable windows of the selected process, including
+            // later popups. Audio is app-wide, independently of this display.
+            Ok(
+                SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(
+                    SCContentFilter::alloc(),
+                    &display,
+                    &NSArray::from_retained_slice(&[app]),
+                    &empty,
+                ),
+            )
+        } else {
+            Ok(SCContentFilter::initWithDisplay_excludingWindows(
                 SCContentFilter::alloc(),
                 &display,
                 &empty,
-            )),
+            ))
         }
     }
 }
@@ -616,7 +677,18 @@ fn run(
     let mut retry_at = Instant::now();
     let mut failure = None;
     let mut detached = None;
+    let mut check_process_at = Instant::now();
     loop {
+        if !state.cancelled.load(Ordering::SeqCst) && Instant::now() >= check_process_at {
+            check_process_at = Instant::now() + Duration::from_millis(250);
+            if let Some(process) = selected_process(&request.source)
+                && let Err(error) = validate_process(process)
+            {
+                state.publisher.fail(error.clone());
+                let _ = ready.try_send(Err(error));
+                state.cancelled.store(true, Ordering::SeqCst);
+            }
+        }
         if state.stopped_after_start.load(Ordering::SeqCst) && !stop.starting {
             let _ = ready.try_send(Err(CaptureError::Unavailable(
                 "Screen stream stopped during startup".into(),
@@ -761,6 +833,8 @@ pub fn start(
             | SourceKey::Window { .. }
             | SourceKey::ApplicationVideo { .. }
             | SourceKey::ApplicationAudio(_)
+            | SourceKey::ApplicationProcessVideo { .. }
+            | SourceKey::ApplicationProcessAudio(_)
             | SourceKey::SystemAudio
     ) {
         return Err(CaptureError::Unavailable(
@@ -879,6 +953,39 @@ mod tests {
         assert!(unique_pid([0, -1]).is_err());
         assert!(unique_pid([12, 13]).is_err());
         assert_eq!(unique_pid([12, 12]).unwrap(), 12);
+    }
+
+    #[test]
+    fn process_capture_rejects_own_and_unverifiable_targets() {
+        let process = application_identity::process_metadata(std::process::id() as i32)
+            .unwrap()
+            .id;
+        assert!(
+            validate_process(&process)
+                .unwrap_err()
+                .to_string()
+                .contains("own application")
+        );
+        let absent = ApplicationProcessId {
+            pid: i32::MAX,
+            ..process
+        };
+        assert!(
+            validate_process(&absent)
+                .unwrap_err()
+                .to_string()
+                .contains("reselect")
+        );
+        for source in [
+            SourceKey::ApplicationProcessVideo {
+                process,
+                display: 1,
+            },
+            SourceKey::ApplicationProcessAudio(process),
+        ] {
+            assert_eq!(selected_process(&source), Some(&process));
+        }
+        assert!(selected_process(&SourceKey::SystemAudio).is_none());
     }
 
     #[test]

@@ -42,8 +42,7 @@ pub struct Writer {
     native: Option<NativeWriter>,
     canvas: Resolution,
     last_video: Option<f64>,
-    last_audio: Option<f64>,
-    audio_end: Option<f64>,
+    audio_timing: Option<AudioTiming>,
     _local: PhantomData<Rc<()>>,
 }
 
@@ -125,8 +124,7 @@ impl Writer {
                 }),
                 canvas: output.resolution,
                 last_video: None,
-                last_audio: None,
-                audio_end: None,
+                audio_timing: None,
                 _local: PhantomData,
             };
             let native = result.native.as_ref().unwrap();
@@ -184,25 +182,23 @@ impl Writer {
     ) -> Result<bool, String> {
         let time = media_time(timestamp)?;
         let native = self.writing()?;
-        let (accepted, duration) = autoreleasepool(|_| unsafe {
+        let (accepted, timing) = autoreleasepool(|_| unsafe {
             // Validate even when the input is not ready, without native mutation.
             let asbd = pcm_description(sample, offset, frames)?;
             let duration = frames as f64 / asbd.mSampleRate;
-            if let (Some(previous), Some(end)) = (self.last_audio, self.audio_end) {
-                validate_audio_timestamp(timestamp, previous, end, asbd.mSampleRate)?;
-            }
+            let timing =
+                AudioTiming::next(self.audio_timing, timestamp, duration, asbd.mSampleRate)?;
             if !native.audio.isReadyForMoreMediaData() {
-                return Ok((readiness(&native.writer, false)?, duration));
+                return Ok((readiness(&native.writer, false)?, timing));
             }
             let copied = copy_audio(sample, offset, frames, time, asbd)?;
             Ok::<_, String>((
                 readiness(&native.writer, native.audio.appendSampleBuffer(&copied))?,
-                duration,
+                timing,
             ))
         })?;
         if accepted {
-            self.last_audio = Some(timestamp);
-            self.audio_end = Some(timestamp + duration);
+            self.audio_timing = Some(timing);
         }
         Ok(accepted)
     }
@@ -273,17 +269,63 @@ impl Drop for Writer {
     }
 }
 
+const AUDIO_CLOCK_DRIFT: f64 = 0.001;
+const AUDIO_TIMESTAMP_JITTER: f64 = 0.001;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AudioTiming {
+    start: f64,
+    end: f64,
+    minimum_next: f64,
+}
+
+impl AudioTiming {
+    // Propose timing without committing it: refused appends must be retryable.
+    fn next(
+        previous: Option<Self>,
+        timestamp: f64,
+        duration: f64,
+        rate: f64,
+    ) -> Result<Self, String> {
+        let mut minimum_start = timestamp;
+        if let Some(previous) = previous {
+            // Device PTS can fluctuate more than the clock's long-term rate.
+            // Bound phase jitter to 1 ms, and to 10% of short/trimmed buffers.
+            let jitter = AUDIO_TIMESTAMP_JITTER.min((previous.end - previous.start) * 0.1);
+            validate_audio_timestamp(timestamp, previous.start, previous.end, rate, jitter)?;
+            // A per-buffer allowance alone would admit sustained overlapping
+            // PCM. Carry a lower clock envelope forward at the fastest supported
+            // rate; jitter and rounding get one shared budget, not one per buffer.
+            let tolerance = AUDIO_TIMESTAMP_JITTER + 1.0 / rate;
+            if previous.minimum_next - timestamp > tolerance {
+                return Err(format!(
+                    "Audio spans accumulate overlap beyond clock jitter: earliest next \
+                     {:.9}s, next {timestamp:.9}s (jitter tolerance {tolerance:.9}s)",
+                    previous.minimum_next
+                ));
+            }
+            minimum_start = minimum_start.max(previous.minimum_next);
+        }
+        Ok(Self {
+            start: timestamp,
+            end: timestamp + duration,
+            minimum_next: minimum_start + duration * (1.0 - AUDIO_CLOCK_DRIFT),
+        })
+    }
+}
+
 fn validate_audio_timestamp(
     timestamp: f64,
     previous: f64,
     end: f64,
     rate: f64,
+    jitter: f64,
 ) -> Result<(), String> {
     // Host-converted PTS includes hardware drift; PCM duration is nominal.
     // Allow one PCM frame of quantization plus the 0.1% clock-rate tolerance
-    // used by capture. Keep the original group PTS for AVFoundation instead of
-    // snapping each buffer to a nominal end (which accumulates A/V drift).
-    let tolerance = 1.0 / rate + (end - previous) * 0.001;
+    // used by capture and bounded phase jitter. Keep the original group PTS for
+    // AVFoundation instead of snapping to nominal ends (accumulating A/V drift).
+    let tolerance = 1.0 / rate + (end - previous) * AUDIO_CLOCK_DRIFT + jitter;
     if timestamp <= previous || end - timestamp > tolerance {
         return Err(format!(
             "Audio spans must not overlap or run backwards: previous start {previous:.9}s, \

@@ -3,16 +3,27 @@
 pub mod registry;
 pub mod service;
 
-use crate::model::{AudioSourceSelector, VideoSourceSelector};
+use crate::model::{ApplicationProcessId, AudioSourceSelector, VideoSourceSelector};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceKey {
     Camera(String),
     Microphone(String),
     Display(u32),
-    Window { id: u32, owner: Option<String> },
-    ApplicationVideo { bundle: String, display: u32 },
+    Window {
+        id: u32,
+        owner: Option<String>,
+    },
+    ApplicationVideo {
+        bundle: String,
+        display: u32,
+    },
     ApplicationAudio(String),
+    ApplicationProcessVideo {
+        process: ApplicationProcessId,
+        display: u32,
+    },
+    ApplicationProcessAudio(ApplicationProcessId),
     SystemAudio,
 }
 
@@ -38,6 +49,14 @@ impl SourceKey {
                 bundle: bundle_id.0.clone(),
                 display: display_id.0,
             },
+            VideoSourceSelector::ApplicationProcess {
+                process,
+                display_id,
+                ..
+            } => Self::ApplicationProcessVideo {
+                process: *process,
+                display: display_id.0,
+            },
         })
     }
 
@@ -50,6 +69,9 @@ impl SourceKey {
             AudioSourceSelector::Application { bundle_id, .. } => {
                 Self::ApplicationAudio(bundle_id.0.clone())
             }
+            AudioSourceSelector::ApplicationProcess { process, .. } => {
+                Self::ApplicationProcessAudio(*process)
+            }
             AudioSourceSelector::System => Self::SystemAudio,
         })
     }
@@ -57,7 +79,10 @@ impl SourceKey {
     pub fn is_audio(&self) -> bool {
         matches!(
             self,
-            Self::Microphone(_) | Self::ApplicationAudio(_) | Self::SystemAudio
+            Self::Microphone(_)
+                | Self::ApplicationAudio(_)
+                | Self::ApplicationProcessAudio(_)
+                | Self::SystemAudio
         )
     }
 }
@@ -163,4 +188,85 @@ pub trait CaptureBackend<T: Clone + Send + 'static> {
         request: &CaptureRequest,
         publisher: registry::SamplePublisher<T>,
     ) -> Result<Box<dyn CaptureSession>, CaptureError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::DisplayId;
+
+    #[test]
+    fn application_process_capture_keys_share_only_exact_identity_and_media() {
+        let process = ApplicationProcessId {
+            pid: 42,
+            start_time: [123, 456],
+            session: uuid::Uuid::from_u128(1),
+        };
+        let video = |process, display, label: &str| {
+            SourceKey::video(&VideoSourceSelector::ApplicationProcess {
+                process,
+                display_id: DisplayId(display),
+                label: label.into(),
+            })
+            .unwrap()
+        };
+        let audio = |process, label: &str| {
+            SourceKey::audio(&AudioSourceSelector::ApplicationProcess {
+                process,
+                label: label.into(),
+            })
+            .unwrap()
+        };
+        let video_key = video(process, 1, "App");
+        let audio_key = audio(process, "App");
+        assert_eq!(
+            video_key,
+            SourceKey::ApplicationProcessVideo {
+                process,
+                display: 1
+            }
+        );
+        assert_eq!(audio_key, SourceKey::ApplicationProcessAudio(process));
+        assert_eq!(video_key, video(process, 1, "Renamed"));
+        assert_eq!(audio_key, audio(process, "Renamed"));
+        assert_ne!(video_key, video(process, 2, "App"));
+        assert_ne!(video_key, audio_key);
+        assert!(!video_key.is_audio());
+        assert!(audio_key.is_audio());
+        for different in [
+            ApplicationProcessId { pid: 43, ..process },
+            ApplicationProcessId {
+                start_time: [124, 456],
+                ..process
+            },
+            ApplicationProcessId {
+                start_time: [123, 457],
+                ..process
+            },
+            ApplicationProcessId {
+                session: uuid::Uuid::from_u128(2),
+                ..process
+            },
+            ApplicationProcessId {
+                session: uuid::Uuid::nil(),
+                ..process
+            },
+        ] {
+            assert_ne!(video_key, video(different, 1, "App"));
+            assert_ne!(audio_key, audio(different, "App"));
+        }
+        let video_format = CaptureFormat::Video {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+        let audio_format = CaptureFormat::Audio {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        assert!(video_format.validate(&video_key).is_ok());
+        assert!(audio_format.validate(&audio_key).is_ok());
+        assert!(video_format.validate(&audio_key).is_err());
+        assert!(audio_format.validate(&video_key).is_err());
+    }
 }

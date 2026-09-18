@@ -42,13 +42,16 @@ impl SourceCatalog {
     /// Window IDs are valid only within this process session. The caller MUST
     /// keep restored window selections unavailable after this call until the
     /// user explicitly reselects a window, even if its numeric ID matches.
+    /// Restored application processes have nil sessions and cannot revalidate.
     pub fn revalidate(&self, config: &mut RecordingConfig) {
         config.video_availability = availability(
             !matches!(config.video, VideoSourceSelector::None)
+                && !matches!(&config.video, VideoSourceSelector::ApplicationProcess { process, .. } if process.session.is_nil())
                 && self.videos.iter().any(|v| same_video(v, &config.video)),
         );
         config.audio_availability = availability(
             !matches!(config.audio, AudioSourceSelector::None)
+                && !matches!(&config.audio, AudioSourceSelector::ApplicationProcess { process, .. } if process.session.is_nil())
                 && self.audios.iter().any(|a| same_audio(a, &config.audio)),
         );
     }
@@ -123,6 +126,18 @@ pub fn same_video(a: &VideoSourceSelector, b: &VideoSourceSelector) -> bool {
                 ..
             },
         ) => a == b && ad == bd,
+        (
+            ApplicationProcess {
+                process: a,
+                display_id: ad,
+                ..
+            },
+            ApplicationProcess {
+                process: b,
+                display_id: bd,
+                ..
+            },
+        ) => a == b && ad == bd,
         _ => false,
     }
 }
@@ -133,6 +148,7 @@ pub fn same_audio(a: &AudioSourceSelector, b: &AudioSourceSelector) -> bool {
         (None, None) | (System, System) => true,
         (Microphone { device_id: a, .. }, Microphone { device_id: b, .. }) => a == b,
         (Application { bundle_id: a, .. }, Application { bundle_id: b, .. }) => a == b,
+        (ApplicationProcess { process: a, .. }, ApplicationProcess { process: b, .. }) => a == b,
         _ => false,
     }
 }
@@ -140,7 +156,102 @@ pub fn same_audio(a: &AudioSourceSelector, b: &AudioSourceSelector) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BundleId, DeviceId, DisplayId, WindowId};
+    use crate::model::{ApplicationProcessId, BundleId, DeviceId, DisplayId, WindowId};
+
+    #[test]
+    fn application_process_identity_uses_pid_start_time_session_and_video_display() {
+        let process = ApplicationProcessId {
+            pid: 42,
+            start_time: [123, 456],
+            session: uuid::Uuid::from_u128(1),
+        };
+        let video = |process, display, label: &str| VideoSourceSelector::ApplicationProcess {
+            process,
+            display_id: DisplayId(display),
+            label: label.into(),
+        };
+        let audio = |process, label: &str| AudioSourceSelector::ApplicationProcess {
+            process,
+            label: label.into(),
+        };
+        assert!(same_video(
+            &video(process, 1, "Old"),
+            &video(process, 1, "New")
+        ));
+        assert!(same_audio(&audio(process, "Old"), &audio(process, "New")));
+        assert!(!same_video(
+            &video(process, 1, "App"),
+            &video(process, 2, "App")
+        ));
+        for different in [
+            ApplicationProcessId { pid: 43, ..process },
+            ApplicationProcessId {
+                start_time: [124, 456],
+                ..process
+            },
+            ApplicationProcessId {
+                start_time: [123, 457],
+                ..process
+            },
+            ApplicationProcessId {
+                session: uuid::Uuid::from_u128(2),
+                ..process
+            },
+            ApplicationProcessId {
+                session: uuid::Uuid::nil(),
+                ..process
+            },
+        ] {
+            assert!(!same_video(
+                &video(process, 1, "App"),
+                &video(different, 1, "App")
+            ));
+            assert!(!same_audio(
+                &audio(process, "App"),
+                &audio(different, "App")
+            ));
+        }
+        let mut config = RecordingConfig::new("Process");
+        config.video = video(process, 2, "Saved");
+        config.audio = audio(process, "Saved");
+        SourceCatalog {
+            videos: vec![video(process, 1, "Renamed")],
+            audios: vec![audio(process, "Renamed")],
+            ..Default::default()
+        }
+        .revalidate(&mut config);
+        assert_eq!(config.video_availability, SourceAvailability::Unavailable);
+        assert_eq!(config.audio_availability, SourceAvailability::Available);
+        assert_eq!(config.video, video(process, 2, "Saved"));
+        assert_eq!(config.audio, audio(process, "Saved"));
+    }
+
+    #[test]
+    fn nil_application_process_is_unavailable_even_if_in_catalog() {
+        let process = ApplicationProcessId {
+            pid: 42,
+            start_time: [123, 456],
+            session: uuid::Uuid::nil(),
+        };
+        let mut config = RecordingConfig::new("Restored");
+        config.video = VideoSourceSelector::ApplicationProcess {
+            process,
+            display_id: DisplayId(1),
+            label: "App".into(),
+        };
+        config.audio = AudioSourceSelector::ApplicationProcess {
+            process,
+            label: "App".into(),
+        };
+        SourceCatalog {
+            videos: vec![config.video.clone()],
+            audios: vec![config.audio.clone()],
+            ..Default::default()
+        }
+        .revalidate(&mut config);
+        assert_eq!(config.video_availability, SourceAvailability::Unavailable);
+        assert_eq!(config.audio_availability, SourceAvailability::Unavailable);
+    }
 
     fn camera(id: &str, label: &str) -> VideoSourceSelector {
         VideoSourceSelector::Camera {
