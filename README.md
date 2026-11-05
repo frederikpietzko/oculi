@@ -1,5 +1,7 @@
 # Oculi
 
+# Superseded by Oculi 2! https://github.com/frederikpietzko/oculi2
+
 A native Rust/AppKit multi-recording app for macOS 15+.
 
 For project development, see [AGENTS.md](AGENTS.md) for the code map, safety
